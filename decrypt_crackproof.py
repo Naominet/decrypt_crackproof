@@ -1228,7 +1228,10 @@ def main():
                             w16(data, rva32, 0)  # clear hint
                     thunk += 8
                     func_count += 1
-                print(f'  DLL: {dll_name} ({func_count} functions)')
+                try:
+                    print(f'  DLL: {dll_name} ({func_count} functions)')
+                except UnicodeEncodeError:
+                    print(f'  DLL: {dll_name.encode("ascii", errors="backslashreplace").decode("ascii")} ({func_count} functions)')
                 dll_count += 1
                 idt_pos += 20
         print(f'  Total: {dll_count} DLLs')
