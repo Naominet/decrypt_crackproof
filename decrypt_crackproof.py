@@ -1,6 +1,9 @@
 import struct
 import os
 import sys
+import zlib
+import array
+import time as _time
 
 # ============================================================
 # CrackProof Shell Unpacker (DLL + EXE, PE32 + PE32+)
@@ -8,70 +11,63 @@ import sys
 # Reference: DecryptCrackproofDll64 (C#)
 # ============================================================
 
+_t0 = _time.perf_counter()
+def _elapsed():
+    return f'[{_time.perf_counter()-_t0:.2f}s]'
+
 # ---------- helpers ----------
+_u16 = struct.Struct('<H')
+_u32 = struct.Struct('<I')
+_u64 = struct.Struct('<Q')
+
 def u8(data, off):
     return data[off]
 
 def u16(data, off):
-    return struct.unpack_from('<H', data, off)[0]
+    return _u16.unpack_from(data, off)[0]
 
 def u32(data, off):
-    return struct.unpack_from('<I', data, off)[0]
+    return _u32.unpack_from(data, off)[0]
 
 def u64(data, off):
-    return struct.unpack_from('<Q', data, off)[0]
+    return _u64.unpack_from(data, off)[0]
 
 def w8(data, off, val):
     data[off] = val & 0xFF
 
 def w16(data, off, val):
-    struct.pack_into('<H', data, off, val & 0xFFFF)
+    _u16.pack_into(data, off, val & 0xFFFF)
 
 def w32(data, off, val):
-    struct.pack_into('<I', data, off, val & 0xFFFFFFFF)
+    _u32.pack_into(data, off, val & 0xFFFFFFFF)
 
 def w64(data, off, val):
-    struct.pack_into('<Q', data, off, val & 0xFFFFFFFFFFFFFFFF)
+    _u64.pack_into(data, off, val & 0xFFFFFFFFFFFFFFFF)
 
 def bswap32(v):
-    return struct.unpack('>I', struct.pack('<I', v & 0xFFFFFFFF))[0]
+    return int.from_bytes((v & 0xFFFFFFFF).to_bytes(4, 'little'), 'big')
+
+# Pre-built ror8/rol8 lookup tables: _ROR8[shift][byte], _ROL8[shift][byte]
+_ROR8 = [[0]*256 for _ in range(8)]
+_ROL8 = [[0]*256 for _ in range(8)]
+for _s in range(8):
+    for _b in range(256):
+        _ROR8[_s][_b] = ((_b >> _s) | (_b << (8 - _s))) & 0xFF
+        _ROL8[_s][_b] = ((_b << _s) | (_b >> (8 - _s))) & 0xFF
 
 def ror8(b, n):
-    n &= 7
-    return ((b >> n) | (b << (8 - n))) & 0xFF
+    return _ROR8[n & 7][b]
 
 def rol8(b, n):
-    n &= 7
-    return ((b << n) | (b >> (8 - n))) & 0xFF
+    return _ROL8[n & 7][b]
 
 def get_string(data, off):
-    end = off
-    while end < len(data) and data[end] != 0:
-        end += 1
+    end = data.index(0, off) if 0 in data[off:off+512] else off + 512
     return data[off:end].decode('ascii', errors='replace')
 
-# ---------- CRC32 ----------
-_crc_table = None
-def _init_crc():
-    global _crc_table
-    if _crc_table is not None:
-        return
-    _crc_table = []
-    for i in range(256):
-        c = i
-        for _ in range(8):
-            if c & 1:
-                c = 0xEDB88320 ^ (c >> 1)
-            else:
-                c >>= 1
-        _crc_table.append(c & 0xFFFFFFFF)
-
+# ---------- CRC32 (use zlib C implementation) ----------
 def crc32(data, offset, size, init=0):
-    _init_crc()
-    crc = init ^ 0xFFFFFFFF
-    for i in range(size):
-        crc = _crc_table[(crc ^ data[offset + i]) & 0xFF] ^ (crc >> 8)
-    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+    return zlib.crc32(data[offset:offset + size], init) & 0xFFFFFFFF
 
 def checksum_with_size_xor(data, addr):
     off = u32(data, addr)
@@ -94,12 +90,13 @@ def decrypt_data2(file_data, data, info, decrypt_size):
     offset = info[4] + 4096
     tmp = (info[0] + (~decrypt_size & 0xFFFFFFFF)) & 0xFFFFFFFF
     count = decrypt_size >> 2
+    # Batch read source dwords
+    src_bytes = file_data[offset:offset + count * 4]
+    vals = struct.unpack_from(f'<{count}I', src_bytes, 0)
+    dst_off = info[3]
     for i in range(count):
-        idx = i * 4
-        d_off = offset + idx
-        w_off = info[3] + idx
-        val = u32(file_data, d_off)
-        w32(data, w_off, tmp ^ val)
+        val = vals[i]
+        _u32.pack_into(data, dst_off + i * 4, (tmp ^ val) & 0xFFFFFFFF)
         tmp = ((i * i) ^ ((tmp + val + i) & 0xFFFFFFFF)) & 0xFFFFFFFF
 
 def decrypt_data3(data, data_offset, key, shift):
@@ -107,39 +104,71 @@ def decrypt_data3(data, data_offset, key, shift):
     sz = u32(data, data_offset + 4)
     rev = 32 - shift
     count = sz >> 2
+    M = 0xFFFFFFFF
     for i in range(count):
         addr = off + i * 4
-        val = u32(data, addr) ^ key
-        key = (key + i) & 0xFFFFFFFF
-        val = (((val >> shift) | (val << rev)) & 0xFFFFFFFF)
-        val = (val - i) & 0xFFFFFFFF
-        w32(data, addr, val)
+        val = _u32.unpack_from(data, addr)[0] ^ key
+        key = (key + i) & M
+        val = (((val >> shift) | (val << rev)) & M)
+        val = (val - i) & M
+        _u32.pack_into(data, addr, val)
+
+# Pre-build decrypt_data4 transform: ror5(b) ^ key2 -> ror5 -> ^ key1 -> ror5
+# Since keys cycle 0-255, pre-build 256 full-byte LUTs for decrypt_data4 and decrypt_data5
+_d4_lut = None  # [key1][key2][byte] -> result
+_d5_lut = None
+
+def _build_d4_lut():
+    global _d4_lut
+    if _d4_lut is not None:
+        return
+    ror5 = _ROR8[5]
+    _d4_lut = [[None]*256 for _ in range(256)]
+    for k1 in range(256):
+        for k2 in range(256):
+            tbl = bytearray(256)
+            for b in range(256):
+                v = ror5[b] ^ k2
+                v = ror5[v] ^ k1
+                v = ror5[v]
+                tbl[b] = v
+            _d4_lut[k1][k2] = tbl
+
+def _build_d5_lut():
+    global _d5_lut
+    if _d5_lut is not None:
+        return
+    ror6 = _ROR8[6]
+    _d5_lut = [[None]*256 for _ in range(256)]
+    for k1 in range(256):
+        for k2 in range(256):
+            tbl = bytearray(256)
+            for b in range(256):
+                v = ror6[b] ^ k2
+                v = ror6[v] ^ k1
+                v = ror6[v]
+                tbl[b] = v
+            _d5_lut[k1][k2] = tbl
 
 def decrypt_data4(data, data_offset):
+    _build_d4_lut()
     va = u32(data, data_offset)
     sz = u32(data, data_offset + 4)
     key1 = ((va >> 8) + va) & 0xFF
     key2 = (key1 + 1) & 0xFF
     for i in range(sz):
-        addr = va + i
-        b = data[addr]
-        b = ror8(b, 5) ^ key2
-        b = ror8(b, 5) ^ key1
-        b = ror8(b, 5)
-        data[addr] = b
+        tbl = _d4_lut[key1][key2]
+        data[va + i] = tbl[data[va + i]]
         key1 = (key1 + 1) & 0xFF
         key2 = (key2 + 1) & 0xFF
 
 def decrypt_data5(data, va, size):
+    _build_d5_lut()
     key1 = va & 0xFF
     key2 = (key1 + 1) & 0xFF
     for i in range(size):
-        addr = va + i
-        b = data[addr]
-        b = ror8(b, 6) ^ key2
-        b = ror8(b, 6) ^ key1
-        b = ror8(b, 6)
-        data[addr] = b
+        tbl = _d5_lut[key1][key2]
+        data[va + i] = tbl[data[va + i]]
         key1 = (key1 + 1) & 0xFF
         key2 = (key2 + 1) & 0xFF
 
@@ -180,50 +209,66 @@ def decrypt_data8(data, data_offset, size, key):
         tidx = data_offset + i * 16 + (ri & 0xF)
         data[tidx] = (data[tidx] ^ key) & 0xFF
 
-# ---------- AES ----------
-colum_mix1 = colum_mix2 = colum_mix3 = colum_mix4 = aes_sbox = None
+# ---------- AES (optimized: array.array for direct indexing) ----------
+_cm1 = _cm2 = _cm3 = _cm4 = _sbox = None  # array.array('I')
 
 def load_aes_tables(base_dir):
-    global colum_mix1, colum_mix2, colum_mix3, colum_mix4, aes_sbox
-    colum_mix1 = bytearray(open(os.path.join(base_dir, 'aes_colum_mix1'), 'rb').read())
-    colum_mix2 = bytearray(open(os.path.join(base_dir, 'aes_colum_mix2'), 'rb').read())
-    colum_mix3 = bytearray(open(os.path.join(base_dir, 'aes_colum_mix3'), 'rb').read())
-    colum_mix4 = bytearray(open(os.path.join(base_dir, 'aes_colum_mix4'), 'rb').read())
-    aes_sbox   = bytearray(open(os.path.join(base_dir, 'aes_sbox'), 'rb').read())
-
-def tbl32(tbl, idx):
-    return struct.unpack_from('<I', tbl, idx * 4)[0]
+    global _cm1, _cm2, _cm3, _cm4, _sbox
+    def _load(name):
+        raw = open(os.path.join(base_dir, name), 'rb').read()
+        return array.array('I', raw)  # native u32 array, direct index
+    _cm1 = _load('aes_colum_mix1')
+    _cm2 = _load('aes_colum_mix2')
+    _cm3 = _load('aes_colum_mix3')
+    _cm4 = _load('aes_colum_mix4')
+    _sbox = _load('aes_sbox')
 
 def aes_round(data, data_off, key_off, rounds):
-    state = [0]*4
-    for i in range(4):
-        state[i] = bswap32(u32(data, data_off + i*4)) ^ u32(data, key_off + i*4)
+    # Read 16-byte block as 4 big-endian u32, XOR with round key 0
+    cm1, cm2, cm3, cm4, sb = _cm1, _cm2, _cm3, _cm4, _sbox
+    s0 = bswap32(_u32.unpack_from(data, data_off)[0])      ^ _u32.unpack_from(data, key_off)[0]
+    s1 = bswap32(_u32.unpack_from(data, data_off + 4)[0])  ^ _u32.unpack_from(data, key_off + 4)[0]
+    s2 = bswap32(_u32.unpack_from(data, data_off + 8)[0])  ^ _u32.unpack_from(data, key_off + 8)[0]
+    s3 = bswap32(_u32.unpack_from(data, data_off + 12)[0]) ^ _u32.unpack_from(data, key_off + 12)[0]
     for r in range(1, rounds):
         ki = key_off + r * 16
-        t0 = tbl32(colum_mix2, (state[3]>>16)&0xFF) ^ tbl32(colum_mix3, (state[2]>>8)&0xFF) ^ tbl32(colum_mix1, (state[0]>>24)&0xFF) ^ tbl32(colum_mix4, state[1]&0xFF) ^ u32(data, ki)
-        t1 = tbl32(colum_mix2, (state[0]>>16)&0xFF) ^ tbl32(colum_mix1, (state[1]>>24)&0xFF) ^ tbl32(colum_mix3, (state[3]>>8)&0xFF) ^ tbl32(colum_mix4, state[2]&0xFF) ^ u32(data, ki+4)
-        t2 = tbl32(colum_mix2, (state[1]>>16)&0xFF) ^ tbl32(colum_mix3, (state[0]>>8)&0xFF) ^ tbl32(colum_mix1, (state[2]>>24)&0xFF) ^ tbl32(colum_mix4, state[3]&0xFF) ^ u32(data, ki+8)
-        t3 = tbl32(colum_mix3, (state[1]>>8)&0xFF) ^ tbl32(colum_mix2, (state[2]>>16)&0xFF) ^ tbl32(colum_mix1, (state[3]>>24)&0xFF) ^ tbl32(colum_mix4, state[0]&0xFF) ^ u32(data, ki+12)
-        state = [t0, t1, t2, t3]
+        k0 = _u32.unpack_from(data, ki)[0]
+        k1 = _u32.unpack_from(data, ki + 4)[0]
+        k2 = _u32.unpack_from(data, ki + 8)[0]
+        k3 = _u32.unpack_from(data, ki + 12)[0]
+        t0 = cm2[(s3>>16)&0xFF] ^ cm3[(s2>>8)&0xFF] ^ cm1[(s0>>24)&0xFF] ^ cm4[s1&0xFF] ^ k0
+        t1 = cm2[(s0>>16)&0xFF] ^ cm1[(s1>>24)&0xFF] ^ cm3[(s3>>8)&0xFF] ^ cm4[s2&0xFF] ^ k1
+        t2 = cm2[(s1>>16)&0xFF] ^ cm3[(s0>>8)&0xFF] ^ cm1[(s2>>24)&0xFF] ^ cm4[s3&0xFF] ^ k2
+        t3 = cm3[(s1>>8)&0xFF] ^ cm2[(s2>>16)&0xFF] ^ cm1[(s3>>24)&0xFF] ^ cm4[s0&0xFF] ^ k3
+        s0, s1, s2, s3 = t0, t1, t2, t3
+    # Final round (sbox only)
     fki = key_off + rounds * 16
-    fs = [0]*4
-    fs[0] = ((tbl32(aes_sbox,(state[0]>>24)&0xFF)&0xFF000000)|(tbl32(aes_sbox,(state[3]>>16)&0xFF)&0x00FF0000)|(tbl32(aes_sbox,(state[2]>>8)&0xFF)&0x0000FF00)|(tbl32(aes_sbox,state[1]&0xFF)&0x000000FF)) ^ u32(data,fki)
-    fs[1] = ((tbl32(aes_sbox,(state[1]>>24)&0xFF)&0xFF000000)|(tbl32(aes_sbox,(state[0]>>16)&0xFF)&0x00FF0000)|(tbl32(aes_sbox,(state[3]>>8)&0xFF)&0x0000FF00)|(tbl32(aes_sbox,state[2]&0xFF)&0x000000FF)) ^ u32(data,fki+4)
-    fs[2] = ((tbl32(aes_sbox,(state[2]>>24)&0xFF)&0xFF000000)|(tbl32(aes_sbox,(state[1]>>16)&0xFF)&0x00FF0000)|(tbl32(aes_sbox,(state[0]>>8)&0xFF)&0x0000FF00)|(tbl32(aes_sbox,state[3]&0xFF)&0x000000FF)) ^ u32(data,fki+8)
-    fs[3] = ((tbl32(aes_sbox,(state[3]>>24)&0xFF)&0xFF000000)|(tbl32(aes_sbox,(state[2]>>16)&0xFF)&0x00FF0000)|(tbl32(aes_sbox,(state[1]>>8)&0xFF)&0x0000FF00)|(tbl32(aes_sbox,state[0]&0xFF)&0x000000FF)) ^ u32(data,fki+12)
-    for i in range(4):
-        w32(data, data_off + i*4, bswap32(fs[i]))
+    fk0 = _u32.unpack_from(data, fki)[0]
+    fk1 = _u32.unpack_from(data, fki + 4)[0]
+    fk2 = _u32.unpack_from(data, fki + 8)[0]
+    fk3 = _u32.unpack_from(data, fki + 12)[0]
+    f0 = ((sb[(s0>>24)&0xFF]&0xFF000000)|(sb[(s3>>16)&0xFF]&0x00FF0000)|(sb[(s2>>8)&0xFF]&0x0000FF00)|(sb[s1&0xFF]&0x000000FF)) ^ fk0
+    f1 = ((sb[(s1>>24)&0xFF]&0xFF000000)|(sb[(s0>>16)&0xFF]&0x00FF0000)|(sb[(s3>>8)&0xFF]&0x0000FF00)|(sb[s2&0xFF]&0x000000FF)) ^ fk1
+    f2 = ((sb[(s2>>24)&0xFF]&0xFF000000)|(sb[(s1>>16)&0xFF]&0x00FF0000)|(sb[(s0>>8)&0xFF]&0x0000FF00)|(sb[s3&0xFF]&0x000000FF)) ^ fk2
+    f3 = ((sb[(s3>>24)&0xFF]&0xFF000000)|(sb[(s2>>16)&0xFF]&0x00FF0000)|(sb[(s1>>8)&0xFF]&0x0000FF00)|(sb[s0&0xFF]&0x000000FF)) ^ fk3
+    _u32.pack_into(data, data_off,      bswap32(f0))
+    _u32.pack_into(data, data_off + 4,  bswap32(f1))
+    _u32.pack_into(data, data_off + 8,  bswap32(f2))
+    _u32.pack_into(data, data_off + 12, bswap32(f3))
 
 def aes_decrypt(data, data_off, size, key_off):
-    tmp2 = bytearray(16)
+    prev = bytearray(16)
     rounds = u16(data, key_off + 2)
-    for i in range(size >> 4):
+    koff = key_off + 4
+    nblocks = size >> 4
+    for i in range(nblocks):
         idx = data_off + i * 16
-        tmp = bytearray(data[idx:idx+16])
-        aes_round(data, idx, key_off + 4, rounds)
-        for j in range(16):
-            data[idx+j] ^= tmp2[j]
-        tmp2 = tmp
+        cipher = bytearray(data[idx:idx+16])
+        aes_round(data, idx, koff, rounds)
+        # CBC XOR (16 bytes at a time via int)
+        p = int.from_bytes(data[idx:idx+16], 'little') ^ int.from_bytes(prev, 'little')
+        data[idx:idx+16] = p.to_bytes(16, 'little')
+        prev = cipher
 
 # ---------- LZ Decompression ----------
 def decompress(data, data_off, dest, key_off, s_size, d_size, verbose=False):
@@ -305,7 +350,7 @@ def decompress(data, data_off, dest, key_off, s_size, d_size, verbose=False):
     else:
         return True
 
-# ---------- Custom Decryptor Generator ----------
+# ---------- Custom Decryptor Generator (256-byte LUT) ----------
 def generate_custom_decryptor(data, data_off):
     ops = []
     pos = data_off
@@ -335,17 +380,22 @@ def generate_custom_decryptor(data, data_off):
         if opcode not in OPMAP:
             print(f'Unknown opcode 0x{opcode:02X}')
             return None
-    def decryptor(b):
+    # Build 256-byte LUT
+    lut = bytearray(256)
+    for b in range(256):
+        v = b
         for op in ops:
-            if   op[0] == 'add': b = (b + op[1]) & 0xFF
-            elif op[0] == 'sub': b = (b - op[1]) & 0xFF
-            elif op[0] == 'xor': b = b ^ op[1]
-            elif op[0] == 'rol': b = rol8(b, op[1])
-            elif op[0] == 'ror': b = ror8(b, op[1])
-            elif op[0] == 'inc': b = (b + 1) & 0xFF
-            elif op[0] == 'dec': b = (b - 1) & 0xFF
-        return b
-    return decryptor
+            if   op[0] == 'add': v = (v + op[1]) & 0xFF
+            elif op[0] == 'sub': v = (v - op[1]) & 0xFF
+            elif op[0] == 'xor': v = v ^ op[1]
+            elif op[0] == 'rol': v = _ROL8[op[1] & 7][v]
+            elif op[0] == 'ror': v = _ROR8[op[1] & 7][v]
+            elif op[0] == 'inc': v = (v + 1) & 0xFF
+            elif op[0] == 'dec': v = (v - 1) & 0xFF
+        lut[b] = v
+    # Return translate table for bytes.translate() and also a direct LUT
+    _translate_tbl = bytes.maketrans(bytes(range(256)), bytes(lut))
+    return lut, _translate_tbl
 
 # ---------- DecryptAndDecompress ----------
 def decrypt_and_decompress(data, data_off, key, key_offsets, custom_dec=None, verbose=False):
@@ -358,8 +408,9 @@ def decrypt_and_decompress(data, data_off, key, key_offsets, custom_dec=None, ve
     aes_decrypt(data, src, s_sz, key_offsets[3])
     decrypt_data3(data, data_off, key, 19)
     if custom_dec is not None:
-        for i in range(s_sz):
-            data[src + i] = custom_dec(data[src + i])
+        _lut, _tt = custom_dec
+        # Bulk translate using bytes.translate (C-speed)
+        data[src:src + s_sz] = bytearray(bytes(data[src:src + s_sz]).translate(_tt))
     if s_sz != d_sz:
         return decompress(data, src, dst, key_offsets[1], s_sz, d_sz, verbose=verbose)
     return True
@@ -1051,8 +1102,8 @@ def main():
             file_src = src2 + compress_data_offset
             data[dst2:dst2 + s_sz2] = clean_file_data[file_src:file_src + s_sz2]
             aes_decrypt(data, dst2, s_sz2, key_offsets[2])
-            for i3 in range(s_sz2):
-                data[dst2 + i3] = file_dec(data[dst2 + i3])
+            _lut, _tt = file_dec
+            data[dst2:dst2 + s_sz2] = bytearray(bytes(data[dst2:dst2 + s_sz2]).translate(_tt))
             if s_sz2 != d_sz2:
                 decompress(data, dst2, dst2, key_offsets[0], s_sz2, d_sz2)
             block_count += 1
@@ -1087,8 +1138,7 @@ def main():
             if s_sz3 == 0:
                 break
             zero_ranges.append((src3, s_sz3))
-            for i4 in range(s_sz3):
-                data[src3 + i4] = 0
+            data[src3:src3 + s_sz3] = b'\x00' * s_sz3
             zero_count += 1
         print(f'  Zeroed {zero_count} regions')
         for zr, zs in zero_ranges[:5]:
@@ -1404,7 +1454,7 @@ def main():
         print(f'\n=== Writing {out_file} ===')
         with open(out_file, 'wb') as f:
             f.write(data)
-        print('Done!')
+        print(f'Done! {_elapsed()}')
         return
 
     # ============================================================
@@ -1528,6 +1578,7 @@ def main():
             key_offsets[k*2+l] = u32(data, ka2)
             ka2 += 8
         ka += 32
+    print(f'  key_offsets = [{", ".join(f"0x{ko:08X}" for ko in key_offsets)}]')
 
     # Checksum addresses (PE32)
     second_stage_cs_addr = tbl + 0xB0
@@ -1566,11 +1617,12 @@ def main():
 
     # EighthStage
     seven_start_actual = u32(data, seven_addr)
-    # Find customDecryptor by scanning sevenStage for LFSR block (backward from end, like PE32+)
+    print(f'  sevenStart = 0x{seven_start_actual:X}, sevenDsz = 0x{seven_dsz:X}')
+    # Find LFSR block in sevenStage (scan backward from middle, like PE32+)
     scan_start = max(0, seven_dsz // 2)
     custom_dec_off = find_lfsr_block(data, seven_start_actual, seven_dsz, scan_start, scan_backward=True)
     if custom_dec_off is None:
-        # Try forward from beginning as fallback
+        # Fallback: forward scan
         custom_dec_off = find_lfsr_block(data, seven_start_actual, seven_dsz, 0)
     if custom_dec_off is None:
         print('ERROR: could not locate customDecryptor in sevenStage')
@@ -1580,37 +1632,32 @@ def main():
     decrypt_data6(data, custom_dec_addr)
     custom_dec = generate_custom_decryptor(data, custom_dec_addr)
     if custom_dec is None:
-        print('ERROR: failed to generate custom decryptor')
         return
-    print(f'  customDecryptor generated OK')
 
+    # PE32: eighthStageKey — brute-force search (like PE32+ path)
     seven_cs = checksum_with_size_xor(data, seven_stage_cs_addr)
     eighth_addr = dp_base + 0xC0
     eighth_dsz = u32(data, eighth_addr + 12)
-
-    # PE32: eighthStageKey — brute-force search (like PE32+ path)
-    # Save backup for brute-force attempts
     eighth_src = u32(data, eighth_addr)
     eighth_ssz = u32(data, eighth_addr + 4)
     eighth_backup = bytearray(data[eighth_src:eighth_src + eighth_ssz])
     eighth_pair_bak = bytearray(data[eighth_addr:eighth_addr + 16])
 
-    # Build candidate list: try known gaps from customDecryptor, then scan region before it
+    # Build candidate list: try known gap from end, then gap from customDecryptor
     eighth_key_candidates = []
-    for gap in [0x70, 0xD0, 0x28, 0x50, 0x48, 0x30, 0x40, 0x58, 0x60, 0x20, 0x38, 0x80, 0x90, 0xA0, 0xB0]:
-        off = custom_dec_off - gap
-        if off >= 0 and off + 4 <= seven_dsz:
-            val = u32(data, seven_start_actual + off)
-            if val != 0 and val != 0xCCCCCCCC:
-                eighth_key_candidates.append(off)
-    # Also try fixed offset from end of sevenStage
     for end_gap in [0xD0, 0xC0, 0xE0, 0xB0, 0xA0, 0xF0, 0x100]:
         off = seven_dsz - end_gap
-        if 0 <= off < seven_dsz and off not in eighth_key_candidates:
+        if 0 <= off < seven_dsz:
             val = u32(data, seven_start_actual + off)
             if val != 0 and val != 0xCCCCCCCC:
                 eighth_key_candidates.append(off)
-    # Scan region before customDecryptor for non-zero, non-string values
+    for gap in [0x70, 0xD0, 0x28, 0x50, 0x48, 0x30, 0x40, 0x58, 0x60, 0x20, 0x38, 0x80, 0x90, 0xA0, 0xB0]:
+        off = custom_dec_off - gap
+        if off >= 0 and off + 4 <= seven_dsz and off not in eighth_key_candidates:
+            val = u32(data, seven_start_actual + off)
+            if val != 0 and val != 0xCCCCCCCC:
+                eighth_key_candidates.append(off)
+    # Scan region before customDecryptor
     for off in range(max(0, custom_dec_off - 0x100), custom_dec_off, 4):
         if off not in eighth_key_candidates:
             val = u32(data, seven_start_actual + off)
@@ -1619,27 +1666,22 @@ def main():
 
     eighth_key_success = False
     for ek_off in eighth_key_candidates:
-        # Restore from backup
         data[eighth_src:eighth_src + eighth_ssz] = eighth_backup[:]
         data[eighth_addr:eighth_addr + 16] = eighth_pair_bak[:]
-
         test_key = u32(data, seven_start_actual + ek_off)
         test_key = advance_key(test_key, 3)
         fk8 = (header_checksum ^ fifth_cs ^ seven_cs ^ test_key) & 0xFFFFFFFF
-
         try:
             result = decrypt_and_decompress(data, eighth_addr, fk8, key_offsets, custom_dec, verbose=False)
             if result:
                 eighth_start_test = u32(data, eighth_addr)
                 if 0x1000 < eighth_start_test < len(data):
-                    eighth_key = test_key
                     print(f'  eighthStageKey at seven+0x{ek_off:X}, raw=0x{u32(data, seven_start_actual + ek_off):08X}')
                     print(f'  eighthStage key = 0x{fk8:08X}')
                     eighth_key_success = True
                     break
         except:
             pass
-
     if not eighth_key_success:
         print('ERROR: could not find valid eighthStageKey in sevenStage')
         return
@@ -1648,129 +1690,17 @@ def main():
     print(f'  eighthStageStart = 0x{eighth_start:08X}, dsz = 0x{eighth_dsz:X}')
 
     # ---- Final processing (PE32) ----
-    # Auto-detect eighthStage offsets (same approach as PE32+)
-    # Find LFSR block (file decryptor) by scanning backward
-    print('\n=== Final: File data decryption (PE32) ===')
-
-    # Find ALL LFSR candidates in eighthStage
-    all_lfsrs = []
-    scan_off = 0
-    while scan_off < eighth_dsz - 95:
-        found = find_lfsr_block(data, eighth_start, eighth_dsz, start_off=scan_off)
-        if found is None:
-            break
-        all_lfsrs.append(found)
-        scan_off = found + 96
-    print(f'  Found {len(all_lfsrs)} LFSR candidates: {["0x%X" % x for x in all_lfsrs]}')
-
-    # Find the correct file LFSR: scan backward, try multiple gaps for fileCS
-    off_file_lfsr = None
-    off_file_cs = None
-    for lfsr_off in reversed(all_lfsrs):
-        # Try multiple gaps between fileCS pointer and LFSR data
-        # PE32+/DLL uses 0x58, PE32 EXE may use larger gaps
-        for gap in range(0x58, 0x500, 8):
-            cs_off = lfsr_off - gap
-            if cs_off < 0:
-                break
-            cs_ptr = u32(data, eighth_start + cs_off)
-            if cs_ptr < 0x1000 or cs_ptr >= len(data) - 16:
-                continue
-            # Validate: trial-decrypt and check if it looks like fileCS entry
-            backup = bytes(data[cs_ptr:cs_ptr + 16])
-            decrypt_data5(data, cs_ptr, 16)
-            cs_a = u32(data, cs_ptr)
-            cs_s = u32(data, cs_ptr + 4)
-            data[cs_ptr:cs_ptr + 16] = backup
-            if 0x1000 < cs_a < len(data) and 0 < cs_s < 0x100000:
-                off_file_lfsr = lfsr_off
-                off_file_cs = cs_off
-                print(f'  fileLFSR at eighth+0x{lfsr_off:X} (fileCS at +0x{cs_off:X}, gap=0x{gap:X})')
-                break
-        if off_file_lfsr is not None:
-            break
-    if off_file_lfsr is None:
-        print('ERROR: could not locate file LFSR in eighthStage')
-        return
-
-    # Auto-detect compressedInfo via trial-decrypt
-    compress_data_offset = ((~u32(file_data, 0x1080)) & 0xFFFFFFFF) + 0x1000
-    file_data_len = len(file_data)
-
-    # Find anchor "pm\x00\x00cm\x00\x00"
-    anchor_off = None
-    for aoff in range(eighth_dsz - 8, 0, -1):
-        if data[eighth_start + aoff:eighth_start + aoff + 8] == b'pm\x00\x00cm\x00\x00':
-            anchor_off = aoff
-            break
-    if anchor_off:
-        print(f'  anchor "pm..cm.." at eighth+0x{anchor_off:X}')
-
-    # Collect pointer values in data area
-    scan_from = anchor_off if anchor_off else max(off_file_lfsr - 0x400, 0)
-    all_ptrs = []
-    for doff in range(scan_from, off_file_lfsr, 4):
-        val = u32(data, eighth_start + doff)
-        if 0x10000 < val < len(data) - 16:
-            all_ptrs.append((doff, val))
-
-    # Find compressedInfo by trial-decrypt
-    off_compressed_info = None
-    for doff, ptr_val in all_ptrs:
-        if doff == off_file_cs:
-            continue
-        backup = bytes(data[ptr_val:ptr_val + 16])
-        decrypt_data5(data, ptr_val, 16)
-        src2 = u32(data, ptr_val)
-        s_sz2 = u32(data, ptr_val + 4)
-        dst2 = u32(data, ptr_val + 8)
-        d_sz2 = u32(data, ptr_val + 12)
-        data[ptr_val:ptr_val + 16] = backup
-        src_file_off = src2 + compress_data_offset
-        valid = (s_sz2 > 0 and s_sz2 < 0x200000 and
-                 src_file_off + s_sz2 <= file_data_len and
-                 dst2 >= 0x1000 and dst2 + d_sz2 <= len(data) and
-                 d_sz2 >= s_sz2 and d_sz2 < 0x200000)
-        if valid:
-            off_compressed_info = doff
-            print(f'  compressedInfo at eighth+0x{doff:X}, ptr -> 0x{ptr_val:08X}')
-            break
-
-    if off_compressed_info is None:
-        print('ERROR: could not locate compressedInfo in eighthStage')
-        return
-
-    # Find import table (zeros = IDT not yet populated)
-    off_import_table = None
-    for doff, ptr_val in all_ptrs:
-        if doff == off_file_cs or doff == off_compressed_info:
-            continue
-        first8 = u64(data, ptr_val) if ptr_val + 8 <= len(data) else 1
-        if first8 == 0:
-            off_import_table = doff
-            print(f'  importTable at eighth+0x{off_import_table:X}, ptr -> 0x{u32(data, eighth_start + off_import_table):08X}')
-            break
-
-    # Find zero-out list: another pointer to data that trial-decrypts as (addr, size) pairs
-    off_zero_list = None
-    for doff, ptr_val in all_ptrs:
-        if doff in (off_file_cs, off_compressed_info, off_import_table):
-            continue
-        backup = bytes(data[ptr_val:ptr_val + 16])
-        decrypt_data5(data, ptr_val, 16)
-        z_addr = u32(data, ptr_val)
-        z_sz = u32(data, ptr_val + 4)
-        data[ptr_val:ptr_val + 16] = backup
-        if z_addr >= 0x1000 and z_addr + z_sz <= len(data) and 0 < z_sz < 0x100000:
-            off_zero_list = doff
-            print(f'  zeroList at eighth+0x{doff:X}, ptr -> 0x{ptr_val:08X}')
-            break
+    off_import_table = 0x3C50 + ss_shift
+    off_file_cs      = 0x3C68 + ss_shift
+    off_compressed_info = 0x3C78 + ss_shift
+    off_zero_list    = 0x3C80 + ss_shift
+    off_file_lfsr    = 0x40EC + ss_shift
+    print(f'\n=== Final: File data decryption (PE32) ===')
 
     # File checksums
     file_cs_addr_ptr = eighth_start + off_file_cs
     file_cs_addr = u32(data, file_cs_addr_ptr)
     file_cs_size = u32(data, file_cs_addr_ptr + 4)
-    print(f'  fileCS addr = 0x{file_cs_addr:X}, size = 0x{file_cs_size:X}')
     if file_cs_size > 0:
         file_cs_end = file_cs_addr + file_cs_size
         while file_cs_addr < file_cs_end:
@@ -1781,42 +1711,94 @@ def main():
             decrypt_data5(data, file_cs_addr, 16)
             file_cs_addr += 16
 
-    # File decryptor (already found at off_file_lfsr)
-    file_dec_addr = eighth_start + off_file_lfsr
+    # File decryptor — validate LFSR at expected offset, fallback to scan
+    lfsr_off = off_file_lfsr
+    # Check exact offset first
+    lfsr_found = find_lfsr_block(data, eighth_start, eighth_dsz, lfsr_off)
+    if lfsr_found == lfsr_off:
+        pass  # exact offset is valid
+    else:
+        # Scan all candidates from off_zero_list, pick closest to off_file_lfsr
+        valid_opcodes = {0x04, 0x2C, 0x34, 0x90, 0xC0, 0xC3, 0xFE}
+        lfsr_candidates = []
+        for scan_off in range(off_zero_list, eighth_dsz - 95):
+            abs_off = eighth_start + scan_off
+            sz = data[abs_off + 95]
+            if sz < 10 or sz > 95:
+                continue
+            lfsr = 1
+            decoded = bytearray(sz)
+            src = data[abs_off:abs_off + sz]
+            for bi in range(sz):
+                b = src[bi]
+                for bit in range(8):
+                    b ^= ((lfsr & 1) << bit)
+                    lfsr <<= 1
+                    if lfsr & 0x8000: lfsr ^= 0x8003
+                    lfsr &= 0xFFFF
+                decoded[bi] = b
+            if decoded[0] in valid_opcodes and 0xC3 in decoded:
+                lfsr_candidates.append(scan_off)
+        if lfsr_candidates:
+            lfsr_off = min(lfsr_candidates, key=lambda c: abs(c - off_file_lfsr))
+            print(f'  fileLFSR adjusted: eighth+0x{lfsr_off:X} (expected 0x{off_file_lfsr:X}, {len(lfsr_candidates)} candidates)')
+        else:
+            print('ERROR: could not locate file LFSR in eighthStage')
+            return
+    print(f'  fileLFSR at eighth+0x{lfsr_off:X}')
+    file_dec_addr = eighth_start + lfsr_off
     decrypt_data6(data, file_dec_addr)
     file_dec = generate_custom_decryptor(data, file_dec_addr)
     if file_dec is None:
         return
 
-    # Save EP from info[3] before overwrite
-    original_ep = u32(data, info[3] + 0x10)
+    # ---- PE32 metadata: EP and data dirs from info[3] ----
+    test_val = u32(data, info[3] + 0x10)
+    metadata_ep = None
+    metadata_dirs = None  # 128 bytes of data directories (16 entries × 8 bytes)
 
-    # Save PE header values before file_data copy
+    if test_val > 0x10000:
+        # Layout B: decrypt info[3]+0x10 (0x290 bytes), EP at +0x20, data dirs at +0x30
+        backup_meta = bytes(data[info[3] + 0x10:info[3] + 0x10 + 0x290])
+        decrypt_data5(data, info[3] + 0x10, 0x290)
+        metadata_ep = u32(data, info[3] + 0x20)
+        metadata_dirs = bytes(data[info[3] + 0x30:info[3] + 0x30 + 128])
+        print(f'  Metadata Layout B: EP=0x{metadata_ep:X}')
+        data[info[3] + 0x10:info[3] + 0x10 + 0x290] = backup_meta
+    else:
+        # Layout A: decrypt info[3]+0x40 (144 bytes), EP at +0x40, data dirs at +0x50
+        backup_meta = bytes(data[info[3] + 0x40:info[3] + 0x40 + 144])
+        decrypt_data5(data, info[3] + 0x40, 144)
+        metadata_ep = u32(data, info[3] + 0x40)
+        metadata_dirs = bytes(data[info[3] + 0x50:info[3] + 0x50 + 128])
+        print(f'  Metadata Layout A: EP=0x{metadata_ep:X}')
+        data[info[3] + 0x40:info[3] + 0x40 + 144] = backup_meta
+
+    # Save PE header values before file_data copy (fallback if metadata fails)
     saved_pe80 = u32(data, pe_header + 0x80)
     saved_pe88 = u32(data, pe_header + 0x88)
     saved_pe8c = u32(data, pe_header + 0x8C)
 
     # Zero-out list (PE32: runs BEFORE decompression)
-    if off_zero_list is not None:
-        zero_list_addr = eighth_start + off_zero_list
-        zero_ptr = u32(data, zero_list_addr)
-        while True:
-            decrypt_data5(data, zero_ptr, 16)
-            src3  = u32(data, zero_ptr)
-            s_sz3 = u32(data, zero_ptr + 4)
-            zero_ptr += 16
-            if s_sz3 == 0: break
-            if src3 + s_sz3 > len(data): break
-            for i4 in range(s_sz3):
-                data[src3 + i4] = 0
-    else:
-        print('  WARNING: zero-out list not found, skipping')
+    zero_list_addr = eighth_start + off_zero_list
+    zero_ptr = u32(data, zero_list_addr)
+    while True:
+        decrypt_data5(data, zero_ptr, 16)
+        src3  = u32(data, zero_ptr)
+        s_sz3 = u32(data, zero_ptr + 4)
+        zero_ptr += 16
+        if s_sz3 == 0: break
+        if src3 + s_sz3 > len(data): break
+        data[src3:src3 + s_sz3] = b'\x00' * s_sz3
 
     # File data decompression
     clean_file_data = bytearray(open(in_file, 'rb').read())
-    # compress_data_offset already computed above
+    compress_data_offset = ((~u32(file_data, 0x1080)) & 0xFFFFFFFF) + 0x1000
     compressed_info_addr = eighth_start + off_compressed_info
     compressed_info = u32(data, compressed_info_addr)
+    print(f'  compressDataOffset = 0x{compress_data_offset:X}')
+    print(f'  compressedDataInfo = 0x{compressed_info:08X}')
+    block_count = 0
     while True:
         decrypt_data5(data, compressed_info, 16)
         src2  = u32(data, compressed_info)
@@ -1828,10 +1810,12 @@ def main():
         file_src = src2 + compress_data_offset
         data[dst2:dst2 + s_sz2] = clean_file_data[file_src:file_src + s_sz2]
         aes_decrypt(data, dst2, s_sz2, key_offsets[2])
-        for i3 in range(s_sz2):
-            data[dst2 + i3] = file_dec(data[dst2 + i3])
+        _lut, _tt = file_dec
+        data[dst2:dst2 + s_sz2] = bytearray(bytes(data[dst2:dst2 + s_sz2]).translate(_tt))
         if s_sz2 != d_sz2:
             decompress(data, dst2, dst2, key_offsets[0], s_sz2, d_sz2)
+        block_count += 1
+    print(f'  Decrypted {block_count} data blocks')
 
     # Section fixup
     data[:0x1000] = file_data[:0x1000]
@@ -1852,95 +1836,221 @@ def main():
             export_file_off = export_va - va + f_off
         w32(data, sec_hdr + 16, sz)
         w32(data, sec_hdr + 20, va)
+        # .idata needs RW for IAT (loader writes resolved addresses)
+        if sec_name[:6] == b'.idata':
+            w32(data, sec_hdr + 36, 0xC0000040)
         sec_hdr += 40
     if export_size != 0 and export_file_off != 0:
         data[export_va:export_va + export_size] = file_data[export_file_off:export_file_off + export_size]
 
-    # .text decrypt with decrypt_data8
+    # .text decrypt with decrypt_data8 (PE32: auto-detect key formula)
     if text_size > 0 and text_off > 0:
-        num_pages = text_size // 0x1000
-        for page in range(num_pages):
-            page_key = 0x8000 * (page + 1)
-            page_addr = text_off + page * 0x1000
-            count = 0x1000 >> 4
-            key_state = page_key
-            rk = ((key_state >> 15) | (key_state << 17)) & 0xFFFFFFFF
-            key_state = rk
-            for i in range(1, count):
-                rk = ((key_state >> 15) | (key_state << 17)) & 0xFFFFFFFF
-                ri = (rk + i) & 0xFFFFFFFF
-                key_state = (ri + i) & 0xFFFFFFFF
-                tidx = page_addr + i * 16 + (ri & 0xF)
-                data[tidx] = (data[tidx] ^ key_state) & 0xFF
+        def _d8_page(buf, t_off, pg, pk):
+            pa = t_off + pg * 0x1000
+            k = pk
+            rk = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
+            k = rk
+            for bi in range(1, 256):
+                rk = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
+                ri = (rk + bi) & 0xFFFFFFFF
+                k = (ri + bi) & 0xFFFFFFFF
+                tidx = pa + bi * 16 + (ri & 0xF)
+                buf[tidx] = (buf[tidx] ^ k) & 0xFF
 
-    # Fix data directories (PE32)
+        # Auto-detect key formula by counting 0xCC (int3 padding) on interior code pages.
+        # Correct decryption produces many 0xCC bytes (function alignment padding);
+        # wrong formula corrupts them. Sample pages at 25%, 50%, 75% of .text.
+        num_pages_total = text_size // 0x1000
+        sample_pages = []
+        for frac in (0.25, 0.5, 0.75):
+            pg = int(num_pages_total * frac)
+            if 0 < pg < num_pages_total:
+                sample_pages.append(pg)
+        if not sample_pages and num_pages_total > 1:
+            sample_pages = [num_pages_total // 2]
+
+        formulas = [
+            ('page+1', lambda p: p + 1),
+            ('0x8000*(page+1)', lambda p: 0x8000 * (p + 1)),
+        ]
+        best_score = -1
+        best_name = 'none'
+        best_func = None
+        for fname, ffunc in formulas:
+            total_cc = 0
+            for sp in sample_pages:
+                test_buf = bytearray(data[text_off + sp * 0x1000: text_off + (sp + 1) * 0x1000])
+                # Apply decrypt_data8 to this single page (using local offsets)
+                pa = 0
+                k = ffunc(sp)
+                rk = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
+                k = rk
+                for bi in range(1, 256):
+                    rk = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
+                    ri = (rk + bi) & 0xFFFFFFFF
+                    k = (ri + bi) & 0xFFFFFFFF
+                    tidx = pa + bi * 16 + (ri & 0xF)
+                    if tidx < len(test_buf):
+                        test_buf[tidx] = (test_buf[tidx] ^ k) & 0xFF
+                total_cc += test_buf.count(0xCC)
+            if total_cc > best_score:
+                best_score = total_cc
+                best_name = fname
+                best_func = ffunc
+        if sample_pages:
+            print(f'  decrypt_data8 auto-detect: {best_name} (0xCC score={best_score} on {len(sample_pages)} sample pages)')
+
+        if best_func is not None:
+            print(f'\n=== Decrypting .text with decrypt_data8 ({best_name}) ===')
+            num_pages = text_size // 0x1000
+            for page in range(num_pages):
+                _d8_page(data, text_off, page, best_func(page))
+            print(f'  Decrypted {num_pages} pages')
+        else:
+            print(f'  decrypt_data8: no formula detected, skipping')
+
+    # Fix data directories (PE32: data dirs start at pe+0x78, not pe+0x88)
     exe_pe = u32(data, 60)
-    w32(data, exe_pe + 0x80, saved_pe80)
-    w32(data, exe_pe + 0x88, saved_pe88)
-    w32(data, exe_pe + 0x8C, saved_pe8c)
+    if metadata_dirs is not None:
+        for i in range(128):
+            data[exe_pe + 0x78 + i] = metadata_dirs[i]
+    else:
+        w32(data, exe_pe + 0x80, saved_pe80)
+        w32(data, exe_pe + 0x88, saved_pe88)
+        w32(data, exe_pe + 0x8C, saved_pe8c)
+    # Clear BaseReloc directory (PE32: index 5 = pe+0xA0)
     w32(data, exe_pe + 0xA0, 0)
     w32(data, exe_pe + 0xA4, 0)
-    w32(data, exe_pe + 0xB0, 0)
-    w32(data, exe_pe + 0xB4, 0)
     # PE32: clear DllCharacteristics
     w16(data, exe_pe + 0x5E, 0)
 
-    # Import table (PE32, 4-byte thunks)
-    if off_import_table is not None:
-        import_table_addr = eighth_start + off_import_table
-        import_table_ptr = u32(data, import_table_addr)
-        idt_size = u32(data, import_table_addr + 4)
-    else:
-        import_table_ptr = 0
-        idt_size = 0
-        print('  WARNING: import table not found')
+    # Fix TLS directory (PE32: index 9 = pe+0xC0)
+    # CrackProof doesn't decompress the TLS directory structure in .rdata,
+    # so it stays all zeros. If AddressOfIndex==0, the loader will write to
+    # NULL causing 0xC0000005. We reconstruct the TLS structure from section info.
+    tls_dir_rva = u32(data, exe_pe + 0xC0)
+    tls_dir_sz  = u32(data, exe_pe + 0xC4)
+    if tls_dir_rva > 0 and tls_dir_sz >= 24 and tls_dir_rva + 24 <= len(data):
+        tls_vals = struct.unpack_from('<6I', data, tls_dir_rva)
+        if all(v == 0 for v in tls_vals):
+            # TLS data is all zeros — try to reconstruct
+            image_base = u32(data, exe_pe + 52)
+            # Find .tls and .data sections
+            tls_sec_va = 0; data_sec_va = 0; data_sec_sz = 0
+            _sh = exe_pe + 24 + u16(data, exe_pe + 20)
+            _ns = u16(data, exe_pe + 6)
+            for _i in range(_ns):
+                _s = _sh + _i * 40
+                _nm = data[_s:_s+8]
+                _va = u32(data, _s + 12)
+                _sz = u32(data, _s + 16)
+                if _nm[:4] == b'.tls':
+                    tls_sec_va = _va
+                if _nm[:5] == b'.data':
+                    data_sec_va = _va; data_sec_sz = _sz
+            if tls_sec_va > 0 and data_sec_va > 0:
+                # Reconstruct TLS directory
+                start_raw = image_base + tls_sec_va
+                end_raw = start_raw  # Empty TLS data (safe default)
+                # Use last 16 bytes of .data as scratch for TLS index and callbacks
+                # (these bytes are typically zero in BSS area)
+                idx_addr = image_base + data_sec_va + data_sec_sz - 16
+                cb_addr  = image_base + data_sec_va + data_sec_sz - 8
+                # Make sure the scratch area is zeroed
+                data[data_sec_va + data_sec_sz - 16 : data_sec_va + data_sec_sz] = b'\x00' * 16
+                struct.pack_into('<6I', data, tls_dir_rva,
+                    start_raw, end_raw, idx_addr, cb_addr, 0, 0x300000)
+                print(f'  TLS reconstructed: Start=0x{start_raw:X} End=0x{end_raw:X} Index=0x{idx_addr:X} Cb=0x{cb_addr:X}')
+            else:
+                # Can't reconstruct — clear TLS directory to prevent crash
+                w32(data, exe_pe + 0xC0, 0)
+                w32(data, exe_pe + 0xC4, 0)
+                print(f'  TLS cleared (no .tls/.data section found)')
 
-    if import_table_ptr > 0 and idt_size > 0:
+    # Import table (PE32, 4-byte thunks)
+    import_table_addr = eighth_start + off_import_table
+    import_table_ptr = u32(data, import_table_addr)
+    idt_size = u32(data, import_table_addr + 4)
+    print(f'  importTable: ptr=0x{import_table_ptr:X}, size=0x{idt_size:X}')
+
+    # Also get import RVA from metadata (data dir index 1)
+    metadata_import_rva = 0
+    metadata_import_size = 0
+    if metadata_dirs is not None:
+        metadata_import_rva = _u32.unpack_from(metadata_dirs, 8)[0]
+        metadata_import_size = _u32.unpack_from(metadata_dirs, 12)[0]
+
+    # Validate eighthStage import pointer: check first IDT entry
+    data_len = len(data)
+    eighth_import_valid = False
+    if 0 < import_table_ptr < data_len and 0 < idt_size < 0x10000:
+        test_name = u32(data, import_table_ptr + 12) if import_table_ptr + 20 <= data_len else 0
+        test_ilt = u32(data, import_table_ptr) if import_table_ptr + 4 <= data_len else 0
+        if 0x1000 < test_name < data_len and 0x1000 < test_ilt < data_len:
+            eighth_import_valid = True
+
+    # Validate metadata import pointer
+    metadata_import_valid = False
+    if 0x1000 < metadata_import_rva < data_len - 20:
+        test_name2 = u32(data, metadata_import_rva + 12)
+        test_ilt2 = u32(data, metadata_import_rva)
+        if 0x1000 < test_name2 < data_len and 0x1000 < test_ilt2 < data_len:
+            metadata_import_valid = True
+
+    # Use the best available import table pointer
+    if metadata_import_valid and (not eighth_import_valid or metadata_import_rva != import_table_ptr):
+        import_table_ptr = metadata_import_rva
+        idt_size = metadata_import_size
+    elif not eighth_import_valid:
+        print(f'  WARNING: import table invalid!')
+
+    # Process import table: decrypt DLL names and function hint names
+    data_len = len(data)
+    if 0 < import_table_ptr < data_len and 0 < idt_size < 0x10000:
         idt_pos = import_table_ptr
         idt_end = import_table_ptr + idt_size
+        dll_count = 0
         while idt_pos + 20 <= idt_end:
             ilt_rva  = u32(data, idt_pos)
             name_rva = u32(data, idt_pos + 12)
             iat_rva  = u32(data, idt_pos + 16)
             if ilt_rva == 0 and name_rva == 0 and iat_rva == 0:
                 break
-            if 0 < name_rva < len(data):
+            if 0 < name_rva < data_len:
                 decrypt_data7(data, name_rva, name_rva & 0xFF)
-            thunk_pos = ilt_rva if (0 < ilt_rva < len(data)) else iat_rva
-            if 0 < thunk_pos < len(data):
-                while True:
+            thunk_pos = ilt_rva if (0 < ilt_rva < data_len) else iat_rva
+            if 0 < thunk_pos < data_len - 4:
+                while thunk_pos + 4 <= data_len:
                     thunk_val = u32(data, thunk_pos)
                     if thunk_val == 0: break
                     if not (thunk_val & 0x80000000):
-                        if thunk_val + 2 < len(data):
+                        if thunk_val + 2 < data_len:
                             decrypt_data7(data, thunk_val + 2, thunk_val & 0xFF)
                             w16(data, thunk_val, 0)
                     thunk_pos += 4
+            dll_count += 1
             idt_pos += 20
+        print(f'  Decrypted names for {dll_count} DLLs')
+    else:
+        print(f'  WARNING: import table invalid (ptr=0x{import_table_ptr:X}, size=0x{idt_size:X}), skipping')
 
-    # Update PE header
+    # Update PE header: Import directory (PE32: index 1 = pe+0x80)
     w32(data, exe_pe + 0x80, import_table_ptr)
     w32(data, exe_pe + 0x84, idt_size)
 
-    # Fix IAT directory
-    iat_min = 0xFFFFFFFF; iat_max = 0
-    idt_scan = import_table_ptr
-    while idt_scan + 20 <= import_table_ptr + idt_size:
-        s_ilt = u32(data, idt_scan); s_name = u32(data, idt_scan + 12); s_iat = u32(data, idt_scan + 16)
-        if s_ilt == 0 and s_name == 0 and s_iat == 0: break
-        if s_iat < iat_min: iat_min = s_iat
-        tp = s_iat
-        while u32(data, tp) != 0: tp += 4
-        tp += 4
-        if tp > iat_max: iat_max = tp
-        idt_scan += 20
-    if iat_min < iat_max:
-        w32(data, exe_pe + 0xC0, iat_min)
-        w32(data, exe_pe + 0xC4, iat_max - iat_min)
+    # Clear IAT directory (PE32: index 12 = pe+0xD8) — match reference behavior
+    w32(data, exe_pe + 0xD8, 0)
+    w32(data, exe_pe + 0xDC, 0)
 
-    # EP (PE32)
-    real_ep = u32(file_data, pe_header + 40)
-    w32(data, exe_pe + 40, real_ep)
+    # EP (PE32): use metadata EP from info[3], not packed file header
+    if metadata_ep is not None and metadata_ep > 0:
+        w32(data, exe_pe + 40, metadata_ep)
+        print(f'  EP set to 0x{metadata_ep:X} (from metadata)')
+    else:
+        # Fallback: use original file EP (likely wrong for CrackProof-protected files)
+        real_ep = u32(file_data, pe_header + 40)
+        w32(data, exe_pe + 40, real_ep)
+        print(f'  WARNING: EP set to 0x{real_ep:X} (from packed file header, may be wrong)')
 
     # Write output
     dot = in_file.rfind('.')
@@ -1951,7 +2061,7 @@ def main():
     print(f'\n=== Writing {out_file} ===')
     with open(out_file, 'wb') as f:
         f.write(data)
-    print('Done!')
+    print(f'Done! {_elapsed()}')
 
 
 if __name__ == '__main__':
