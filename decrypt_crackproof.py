@@ -74,6 +74,296 @@ def checksum_with_size_xor(data, addr):
     sz = u32(data, addr + 4)
     return crc32(data, off, sz) ^ sz
 
+def align_up(value, alignment):
+    return (value + alignment - 1) // alignment * alignment
+
+def compact_memory_image_to_pe(data, pe_header, *, file_alignment=0x200, header_size=0x400):
+    """Convert the unpacked RVA-addressed image back to a compact PE file layout.
+
+    CrackProof reconstruction works on a memory-image-like buffer where section
+    data is addressed by RVA. Writing that buffer directly makes PointerToRawData
+    mirror VirtualAddress and bloats the output. The known-good EXE samples use a
+    normal disk layout: headers at 0x400, sections packed consecutively, and raw
+    sizes trimmed to the last meaningful byte with FileAlignment padding.
+    """
+    opt_hdr_size = u16(data, pe_header + 20)
+    opt_hdr = pe_header + 24
+    sec_table = opt_hdr + opt_hdr_size
+    num_sections = u16(data, pe_header + 6)
+
+    old_file_alignment = u32(data, opt_hdr + 36)
+    old_header_size = u32(data, opt_hdr + 60)
+
+    sections = []
+    for idx in range(num_sections):
+        sec_off = sec_table + idx * 40
+        name = bytes(data[sec_off:sec_off + 8]).rstrip(b'\x00').decode('ascii', errors='replace')
+        virtual_size = u32(data, sec_off + 8)
+        virtual_address = u32(data, sec_off + 12)
+        characteristics = u32(data, sec_off + 36)
+        sections.append({
+            'idx': idx,
+            'off': sec_off,
+            'name': name,
+            'virtual_size': virtual_size,
+            'virtual_address': virtual_address,
+            'characteristics': characteristics,
+        })
+
+    raw_cursor = header_size
+    raw_layout = []
+    for sec in sections:
+        va = sec['virtual_address']
+        vsize = sec['virtual_size']
+        section_data = data[va:va + vsize] if va + vsize <= len(data) else data[va:]
+
+        last_nonzero = -1
+        for pos in range(len(section_data) - 1, -1, -1):
+            if section_data[pos] != 0:
+                last_nonzero = pos
+                break
+
+        meaningful_size = last_nonzero + 1 if last_nonzero >= 0 else 0
+        raw_size = align_up(meaningful_size, file_alignment) if meaningful_size else 0
+        if vsize and raw_size == 0:
+            raw_size = file_alignment
+        raw_size = min(raw_size, align_up(len(section_data), file_alignment))
+
+        raw_ptr = raw_cursor if raw_size else 0
+        raw_layout.append((sec, section_data, raw_ptr, raw_size, meaningful_size))
+        if raw_size:
+            raw_cursor = align_up(raw_cursor + raw_size, file_alignment)
+
+    compact = bytearray(raw_cursor)
+    compact[:min(header_size, len(data))] = data[:min(header_size, len(data))]
+
+    # FileAlignment and SizeOfHeaders must describe the compact disk layout.
+    w32(compact, opt_hdr + 36, file_alignment)
+    w32(compact, opt_hdr + 60, header_size)
+
+    print('\n=== Compacting PE raw layout ===')
+    print(f'  FileAlignment: 0x{old_file_alignment:X} -> 0x{file_alignment:X}')
+    print(f'  SizeOfHeaders: 0x{old_header_size:X} -> 0x{header_size:X}')
+
+    for sec, section_data, raw_ptr, raw_size, meaningful_size in raw_layout:
+        sec_off = sec['off']
+        w32(compact, sec_off + 16, raw_size)
+        w32(compact, sec_off + 20, raw_ptr)
+        if raw_size:
+            copy_size = min(raw_size, len(section_data))
+            compact[raw_ptr:raw_ptr + copy_size] = section_data[:copy_size]
+        print(
+            f'  [{sec["idx"]}] {sec["name"]:8s}: '
+            f'RVA=0x{sec["virtual_address"]:08X} VS=0x{sec["virtual_size"]:08X} '
+            f'raw=0x{raw_ptr:08X}/0x{raw_size:08X} meaningful=0x{meaningful_size:08X}'
+        )
+
+    print(f'  Output image: 0x{len(data):X} -> compact file 0x{len(compact):X}')
+    return compact
+
+def move_pe32_imports_to_kmiat(data, pe_header, *, section_size=0x7000):
+    """Move rebuilt PE32 import metadata into the last section as .kmiat.
+
+    The reference unpacked EXEs keep the loader-written IAT in the old .idata
+    range, but place the import descriptors, lookup tables, and names in a final
+    executable/readable/writable .kmiat section. This mirrors that layout without
+    depending on bytes from a known-good sample.
+    """
+    opt_hdr_size = u16(data, pe_header + 20)
+    opt_hdr = pe_header + 24
+    sec_table = opt_hdr + opt_hdr_size
+    num_sections = u16(data, pe_header + 6)
+    if num_sections == 0:
+        return data
+
+    import_rva = u32(data, pe_header + 0x80)
+    import_size = u32(data, pe_header + 0x84)
+    if not (0x1000 < import_rva < len(data) and 0 < import_size < section_size):
+        return data
+
+    descriptors = []
+    idt_pos = import_rva
+    while idt_pos + 20 <= len(data):
+        oft_rva = u32(data, idt_pos)
+        time_date = u32(data, idt_pos + 4)
+        fwd_chain = u32(data, idt_pos + 8)
+        name_rva = u32(data, idt_pos + 12)
+        iat_rva = u32(data, idt_pos + 16)
+        if oft_rva == 0 and name_rva == 0 and iat_rva == 0:
+            break
+        if not (0x1000 < name_rva < len(data)):
+            break
+
+        dll_name = get_string(data, name_rva)
+        thunk_rva = oft_rva if 0x1000 < oft_rva < len(data) else iat_rva
+        functions = []
+        thunk_pos = thunk_rva
+        while 0x1000 < thunk_pos + 4 <= len(data):
+            thunk_val = u32(data, thunk_pos)
+            if thunk_val == 0:
+                break
+            if thunk_val & 0x80000000:
+                functions.append(('ordinal', thunk_val & 0xFFFF))
+            else:
+                hint = u16(data, thunk_val) if thunk_val + 2 <= len(data) else 0
+                func_name = get_string(data, thunk_val + 2) if thunk_val + 2 < len(data) else ''
+                functions.append(('name', hint, func_name))
+            thunk_pos += 4
+
+        descriptors.append({
+            'time_date': time_date,
+            'fwd_chain': fwd_chain,
+            'dll_name': dll_name,
+            'sort_name': dll_name.lower(),
+            'iat_rva': iat_rva,
+            'functions': functions,
+        })
+        idt_pos += 20
+
+    if not descriptors:
+        return data
+
+    for desc in descriptors:
+        lower_name = desc['dll_name'].lower()
+        if lower_name.startswith('api-ms-win-crt-'):
+            desc['dll_name'] = 'ucrtbase.dll'
+        else:
+            desc['dll_name'] = lower_name
+    descriptors.sort(key=lambda desc: desc['iat_rva'])
+
+    last_sec = sec_table + (num_sections - 1) * 40
+    kmiat_rva = u32(data, last_sec + 12)
+    if kmiat_rva <= 0 or kmiat_rva + section_size > len(data):
+        if kmiat_rva + section_size > len(data):
+            data.extend(bytearray(kmiat_rva + section_size - len(data)))
+
+    data[kmiat_rva:kmiat_rva + section_size] = bytearray(section_size)
+
+    idt_size = (len(descriptors) + 1) * 20
+    oft_start = kmiat_rva
+    idt_rva = oft_start
+    for desc in descriptors:
+        idt_rva += (len(desc['functions']) + 1) * 4
+    idt_rva = align_up(idt_rva + 0x2C, 4)
+
+    name_pos = idt_rva + idt_size
+    for desc in descriptors:
+        name_pos += len(desc['dll_name'].encode('ascii', errors='replace')) + 1
+        for func in desc['functions']:
+            if func[0] == 'name':
+                name_pos += 2 + len(func[2].encode('ascii', errors='replace')) + 1
+
+    if name_pos > kmiat_rva + section_size:
+        print('  WARNING: .kmiat section too small for relocated imports; keeping existing import table')
+        return data
+
+    oft_pos = oft_start
+    name_pos = idt_rva + idt_size
+
+    for idx, desc in enumerate(descriptors):
+        idt_entry = idt_rva + idx * 20
+        current_oft = oft_pos
+        w32(data, idt_entry, current_oft)
+        w32(data, idt_entry + 4, desc['time_date'])
+        w32(data, idt_entry + 8, desc['fwd_chain'])
+        dll_name_pos = name_pos
+        w32(data, idt_entry + 12, dll_name_pos)
+        w32(data, idt_entry + 16, desc['iat_rva'])
+
+        dll_name_bytes = desc['dll_name'].encode('ascii', errors='replace') + b'\x00'
+        data[dll_name_pos:dll_name_pos + len(dll_name_bytes)] = dll_name_bytes
+        name_pos += len(dll_name_bytes)
+
+        for func in desc['functions']:
+            if func[0] == 'ordinal':
+                w32(data, oft_pos, 0x80000000 | func[1])
+            else:
+                hint_name_rva = name_pos
+                w32(data, oft_pos, hint_name_rva)
+                w16(data, hint_name_rva, func[1])
+                func_name_bytes = func[2].encode('ascii', errors='replace') + b'\x00'
+                data[hint_name_rva + 2:hint_name_rva + 2 + len(func_name_bytes)] = func_name_bytes
+                name_pos += 2 + len(func_name_bytes)
+            oft_pos += 4
+        w32(data, oft_pos, 0)
+        oft_pos += 4
+
+    data[idt_rva + len(descriptors) * 20:idt_rva + idt_size] = bytearray(20)
+
+    data[last_sec:last_sec + 8] = b'.kmiat\x00\x00'
+    w32(data, last_sec + 8, section_size)
+    w32(data, last_sec + 16, section_size)
+    w32(data, last_sec + 36, 0xE0000060)
+    w32(data, pe_header + 0x80, idt_rva)
+    w32(data, pe_header + 0x84, idt_size)
+    w32(data, pe_header + 80, kmiat_rva + section_size)
+
+    print('\n=== Moving imports to .kmiat ===')
+    print(f'  DLLs: {len(descriptors)}, .kmiat RVA=0x{kmiat_rva:08X}, Import RVA=0x{idt_rva:08X}, Size=0x{idt_size:08X}')
+    return data
+
+def pe32_imports_already_match_idata_layout(data, pe_header):
+    """Return True when PE32 imports are already in the original .idata layout."""
+    opt_hdr_size = u16(data, pe_header + 20)
+    sec_table = pe_header + 24 + opt_hdr_size
+    num_sections = u16(data, pe_header + 6)
+    import_rva = u32(data, pe_header + 0x80)
+    import_size = u32(data, pe_header + 0x84)
+
+    if not (import_rva > 0 and import_size > 0):
+        return False
+
+    for idx in range(num_sections):
+        sec_off = sec_table + idx * 40
+        sec_name = data[sec_off:sec_off + 8]
+        if sec_name[:6] != b'.idata':
+            continue
+        sec_va = u32(data, sec_off + 12)
+        sec_size = max(u32(data, sec_off + 8), u32(data, sec_off + 16))
+        sec_end = sec_va + sec_size
+        if not (sec_va <= import_rva < sec_end and import_rva + import_size <= sec_end):
+            continue
+
+        first_oft = u32(data, import_rva)
+        first_name = u32(data, import_rva + 12)
+        first_iat = u32(data, import_rva + 16)
+        if not (sec_va <= first_oft < sec_end and sec_va <= first_iat < sec_end):
+            return False
+        if not (0x1000 < first_name < len(data)):
+            return False
+
+        dll_name = data[first_name:first_name + 80].split(b'\x00')[0]
+        if not dll_name.lower().endswith(b'.dll'):
+            return False
+
+        iat_min = first_iat
+        iat_max = first_iat
+        idt_pos = import_rva
+        while idt_pos + 20 <= len(data):
+            oft_rva = u32(data, idt_pos)
+            name_rva = u32(data, idt_pos + 12)
+            iat_rva = u32(data, idt_pos + 16)
+            if oft_rva == 0 and name_rva == 0 and iat_rva == 0:
+                break
+            if not (sec_va <= oft_rva < sec_end and sec_va <= iat_rva < sec_end):
+                return False
+            thunk = iat_rva
+            while thunk + 4 <= sec_end:
+                thunk_val = u32(data, thunk)
+                thunk += 4
+                if thunk_val == 0:
+                    break
+            iat_min = min(iat_min, iat_rva)
+            iat_max = max(iat_max, thunk)
+            idt_pos += 20
+
+        if iat_max > iat_min:
+            w32(data, pe_header + 0xD8, iat_min)
+            w32(data, pe_header + 0xDC, iat_max - iat_min)
+        print('  PE32 imports already use .idata layout; skipping .kmiat relocation')
+        return True
+    return False
+
 # ---------- DecryptData1..8 ----------
 def decrypt_data1(file_data):
     base = 4096
@@ -615,7 +905,7 @@ def main():
         w32(data, pe_header + 180, 0)  # TLS Size
         print(f'  Import: RVA=0x{import_rva:X} Size=0x{import_size:X}')
         print(f'  Resource: RVA=0x{res_rva:X} Size=0x{res_size:X}')
-        
+
         # Save these values for later (in case metadata overwrites them with 0)
         saved_import_rva = import_rva
         saved_import_size = import_size
@@ -819,19 +1109,21 @@ def main():
         seven_backup = bytearray(data[seven_src:seven_src + seven_ssz])
         seven_pair_backup = bytearray(data[seven_addr:seven_addr + 16])
 
-        # Build candidate list: scan the fifthStage for non-zero, non-ASCII 4-byte values
+        # Build candidate list: scan the fifthStage for non-zero 4-byte values.
+        # We do NOT filter "ASCII-looking" values - sgimagemount.exe's sevenKey
+        # is 0x4F466231 ('1bFO') which a strict ASCII filter would skip.
         seven_key_candidates = []
-        # First try DLL offset and common heuristics
-        for sk_off in [0x7B0, 0x7A8, 0x7A0, 0x798]:
+        for sk_off in [0x7B0, 0x7A8, 0x7A0, 0x798, 0x880, 0x878, 0x870, 0x868, 0x860, 0x858, 0x830]:
             if sk_off + 4 <= fifth_dsz:
                 seven_key_candidates.append(sk_off)
-        # Then scan last 0x200 bytes of fifthStage for non-trivial values
-        for sk_off in range(max(0, fifth_dsz - 0x200), fifth_dsz - 4, 4):
-            if sk_off not in seven_key_candidates:
-                val = u32(data, fifth_start_actual + sk_off)
-                # Skip zeros and obvious strings (ASCII-like)
-                if val != 0 and val != 0xCCCCCCCC and not all(32 <= ((val >> (i*8)) & 0xFF) < 127 for i in range(4)):
-                    seven_key_candidates.append(sk_off)
+        # Then scan the entire second half of fifthStage for non-zero values
+        # (trial-decrypt is the real validator).
+        for sk_off in range(max(0, fifth_dsz // 2), fifth_dsz - 4, 4):
+            if sk_off in seven_key_candidates:
+                continue
+            val = u32(data, fifth_start_actual + sk_off)
+            if val != 0 and val != 0xCCCCCCCC:
+                seven_key_candidates.append(sk_off)
 
         seven_success = False
         for sk_off in seven_key_candidates:
@@ -966,16 +1258,46 @@ def main():
             all_lfsrs.append(found)
             scan_off = found + 96
 
-        # Find the correct file LFSR: scan backward, validate LFSR-0x58 has a valid pointer
+        # Find the correct file LFSR: scan backward, validate LFSR-0x58 has a valid pointer.
+        # Across known-good samples (amdaemon, sgxsegaboot, sgosupdate, util_sgxsegaboot)
+        # fileCS always lives just past the metadata region at info[3] (offset
+        # info[3]+0x100..info[3]+0x10000). False-positive LFSR blocks earlier in the
+        # eighthStage often have pointer fields that look valid in a generic range
+        # check but point far away from info[3] - prefer the candidate whose fileCS
+        # is closest to (but greater than) info[3].
         off_file_lfsr = None
-        for lfsr_off in reversed(all_lfsrs):
+        info3 = info[3]
+        best_dist = None
+        for lfsr_off in all_lfsrs:
             cs_off = lfsr_off - 0x58
-            if cs_off >= 0:
-                cs_val = u32(data, eighth_start + cs_off)
-                if 0x1000 < cs_val < len(data):
-                    off_file_lfsr = lfsr_off
-                    print(f'  fileLFSR at eighth+0x{lfsr_off:X} (fileCS at +0x{cs_off:X} -> 0x{cs_val:08X})')
-                    break
+            if cs_off < 0:
+                continue
+            cs_val = u32(data, eighth_start + cs_off)
+            if not (0x1000 < cs_val < len(data)):
+                continue
+            # Distance metric: how far past info[3] does fileCS sit?
+            if cs_val < info3:
+                continue
+            dist = cs_val - info3
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                off_file_lfsr = lfsr_off
+
+        if off_file_lfsr is None:
+            # Fallback to legacy behaviour: pick the *last* LFSR with any in-image
+            # pointer (preserves compatibility with samples we already handle).
+            for lfsr_off in reversed(all_lfsrs):
+                cs_off = lfsr_off - 0x58
+                if cs_off >= 0:
+                    cs_val = u32(data, eighth_start + cs_off)
+                    if 0x1000 < cs_val < len(data):
+                        off_file_lfsr = lfsr_off
+                        break
+
+        if off_file_lfsr is not None:
+            cs_off = off_file_lfsr - 0x58
+            cs_val = u32(data, eighth_start + cs_off)
+            print(f'  fileLFSR at eighth+0x{off_file_lfsr:X} (fileCS at +0x{cs_off:X} -> 0x{cs_val:08X})')
         if off_file_lfsr is None:
             print('ERROR: could not locate file LFSR in eighthStage')
             return
@@ -1010,11 +1332,18 @@ def main():
             print(f'  anchor "pm..cm.." at eighth+0x{anchor_off:X}')
 
         # Collect all valid pointer values in the data area (from anchor to LFSR)
-        scan_from = anchor_off if anchor_off else max(off_file_lfsr - 0x400, 0)
+        # NOTE: anchor_off can be 0 (no anchor found AND fallback hit 0) but more
+        # importantly `if anchor_off` would treat anchor at +0 as missing. Use
+        # explicit None check.
+        scan_from = anchor_off if anchor_off is not None else max(off_file_lfsr - 0x400, 0)
         all_ptrs = []
         for doff in range(scan_from, off_file_lfsr, 4):
             val = u32(data, eighth_start + doff)
-            if 0x10000 < val < len(data) - 16:
+            # Small images (e.g. 0x40000 byte EXEs / DLLs) have RVAs well below
+            # 0x10000.  Use a minimum that's still high enough to skip section
+            # header noise (>= 0x1000) but doesn't drop legitimate small-image
+            # pointers.
+            if 0x1000 < val < len(data) - 16:
                 all_ptrs.append((doff, val))
 
         # Trial-decrypt to find compressedInfo: the pointer whose data,
@@ -1150,148 +1479,159 @@ def main():
         if len(zero_ranges) > 5:
             print(f'    ... ({len(zero_ranges)-5} more)')
 
-        # ---- Import table reconstruction (C# DLL reference) ----
-        print('\n=== Import table reconstruction ===')
+        # ---- Metadata + Import + EP + .text decryption (PE32+) ----
+        # CrackProof stores the original entry point and data directories in
+        # one of two encrypted metadata blocks.  Layout depends on shell vintage:
+        #   Layout B (new shell): decrypt 0x290 bytes from info[3]+0x10. EP @+0x20, dirs @+0x30.
+        #   Layout A (old shell): decrypt 144  bytes from info[3]+0x40. EP @+0x40, dirs @+0x50.
+        # We dual-try both, pick the EP that lies inside the image, and pick
+        # the Import RVA among metadata-A / metadata-B / anchor candidates by
+        # validating that the candidate points at a plausible IDT entry.
+        print('\n=== Metadata + Import reconstruction ===')
 
-        # Get the original import directory RVA from metadata at info[3]
-        # The metadata is encrypted with DecryptData5 and contains the original PE data dirs
-        # Layout B: decrypt info[3]+0x10, data dirs at info[3]+0x30
-        # Layout A: decrypt info[3]+0x40, data dirs at info[3]+0x50
-        import_table_ptr = 0
-        test_val = u32(data, info[3] + 0x10)
-        is_layout_a = (test_val <= 0x10000)
-        if test_val > 0x10000:
-            # Layout B: peek at info[3]+0x38 (import dir = second data directory)
-            backup_meta = bytes(data[info[3] + 0x10:info[3] + 0x10 + 0x30])
-            decrypt_data5(data, info[3] + 0x10, 0x30)
-            import_table_ptr = u32(data, info[3] + 0x38)
-            data[info[3] + 0x10:info[3] + 0x10 + 0x30] = backup_meta
-            print(f'  Layout B: original import RVA = 0x{import_table_ptr:X}')
+        backup = bytes(data[info[3] + 0x10:info[3] + 0x10 + 0x290])
+        decrypt_data5(data, info[3] + 0x10, 0x290)
+        ep_B   = u32(data, info[3] + 0x20)
+        dirs_B = bytes(data[info[3] + 0x30:info[3] + 0x30 + 128])
+        data[info[3] + 0x10:info[3] + 0x10 + 0x290] = backup
+
+        backupA = bytes(data[info[3] + 0x40:info[3] + 0x40 + 144])
+        decrypt_data5(data, info[3] + 0x40, 144)
+        ep_A   = u32(data, info[3] + 0x40)
+        dirs_A = bytes(data[info[3] + 0x50:info[3] + 0x50 + 128])
+        data[info[3] + 0x40:info[3] + 0x40 + 144] = backupA
+
+        # Restore the protected file's PE header into the live image so that
+        # section bookkeeping operates on a known-good copy.
+        data[:0x1000] = file_data[:0x1000]
+        exe_pe = u32(data, 60)
+        opt_hdr_size = u16(file_data, pe_header + 20)
+        sec_hdr_base = pe_header + 24 + opt_hdr_size
+        image_size = u32(file_data, pe_header + 80)
+
+        # Pick layout. Layout B is the modern shell default. Prefer it whenever
+        # its EP is non-garbage (anything within image, including 0 - some
+        # SEGA system components have their EP zeroed by CrackProof and we
+        # patch a stub EP from the mscoree IAT later). Fall back to Layout A
+        # only if the Layout-B EP is out of bounds.
+        if 0 <= ep_B < image_size:
+            original_ep, dirs, layout = ep_B, dirs_B, 'B'
+        elif 0 < ep_A < image_size:
+            original_ep, dirs, layout = ep_A, dirs_A, 'A'
+        elif ss_size == 0x10C8:
+            original_ep, dirs, layout = ep_A, dirs_A, 'A(ss)'
         else:
-            # Layout A: peek at info[3]+0x58
-            backup_meta = bytes(data[info[3] + 0x40:info[3] + 0x40 + 0x20])
-            decrypt_data5(data, info[3] + 0x40, 0x20)
-            import_table_ptr = u32(data, info[3] + 0x58)
-            peeked_ep = u32(data, info[3] + 0x40)
-            data[info[3] + 0x40:info[3] + 0x40 + 0x20] = backup_meta
-            print(f'  Layout A: original import RVA = 0x{import_table_ptr:X}, EP = 0x{peeked_ep:X}')
+            original_ep, dirs, layout = ep_B, dirs_B, 'B(ss)'
 
-        # Validate
-        if import_table_ptr > 0 and import_table_ptr + 20 <= len(data):
-            test_name = u32(data, import_table_ptr + 12)
-            if test_name == 0 or test_name >= len(data):
-                print(f'  WARNING: importTableBase 0x{import_table_ptr:X} has invalid name RVA 0x{test_name:X}')
-                import_table_ptr = 0
+        # Replace the data directories with the chosen layout's view.
+        data[exe_pe + 0x88:exe_pe + 0x88 + 128] = dirs
 
-        # If importTable was found in the eighthStage data area as fallback
-        if import_table_ptr == 0 and off_import_table is not None:
-            import_table_ptr = u32(data, eighth_start + off_import_table)
-            test_name = u32(data, import_table_ptr + 12) if import_table_ptr + 20 <= len(data) else 0
-            if test_name == 0 or test_name >= len(data):
-                import_table_ptr = 0
+        # Pick Import RVA candidate. The metadata's import dir is the truth for
+        # most amdaemon samples; for some SEGA system components the metadata
+        # leaves it zero and the anchor stage's value is the only one we have.
+        def _idt_plausible(rva, size):
+            if not (0x1000 < rva < image_size and 0 < size < 0x10000):
+                return False
+            return u32(data, rva + 12) != 0  # NameRVA non-zero
 
-        if import_table_ptr == 0:
-            print('  WARNING: Could not find import table, skipping import reconstruction')
-        else:
-            print(f'  importTableBase = 0x{import_table_ptr:X}')
+        cand_b = (struct.unpack_from('<II', dirs_B, 8))   # dirs_B[1]
+        cand_a = (struct.unpack_from('<II', dirs_A, 8))   # dirs_A[1]
+        cand_anchor = (saved_import_rva, saved_import_size)
 
-        # Walk IDT and decrypt DLL/function names (like C# DLL reference)
-        # PE32+: 8-byte thunks (same as C# DLL which uses thunk += 8)
-        dll_count = 0
-        if import_table_ptr > 0:
-            idt_pos = import_table_ptr
-            while True:
-                name_rva = u32(data, idt_pos + 12)
-                if name_rva == 0:
-                    break
-                if name_rva >= len(data):
-                    print(f'  WARNING: name_rva 0x{name_rva:X} out of range, stopping IDT walk')
-                    break
-                # Decrypt DLL name
-                decrypt_data7(data, name_rva, name_rva & 0xFF)
-                dll_name = get_string(data, name_rva)
+        import_rva_final, import_size_final = 0, 0
+        for rva, sz in (cand_b, cand_a, cand_anchor):
+            if _idt_plausible(rva, sz):
+                import_rva_final, import_size_final = rva, sz
+                break
+        # Even if no candidate validates, fall back to the anchor value so that
+        # the loader at least sees a non-zero pointer (rare edge case).
+        if import_rva_final == 0 and saved_import_rva:
+            import_rva_final, import_size_final = saved_import_rva, saved_import_size
 
-                # Get thunk table (prefer OriginalFirstThunk, fallback to FirstThunk)
-                orig_first_thunk = u32(data, idt_pos)
-                first_thunk = u32(data, idt_pos + 16)
-                thunk = orig_first_thunk if orig_first_thunk != 0 else first_thunk
+        # Set entry point (0 is legal: TLS-only / SEGA system component).
+        w32(data, exe_pe + 40, original_ep)
+        # Write the chosen Import RVA into the PE header.
+        w32(data, exe_pe + 0x90, import_rva_final)
+        w32(data, exe_pe + 0x94, import_size_final)
+        print(f'  Layout {layout}: EP=0x{original_ep:X}, Import RVA=0x{import_rva_final:X}/{import_size_final:X}')
 
-                func_count = 0
-                while True:
-                    if thunk + 8 > len(data):
-                        break
-                    # PE32+: 8-byte thunk entries
-                    func_name_rva = u64(data, thunk)
-                    if func_name_rva == 0:
-                        break
-                    if not (func_name_rva & 0x8000000000000000):
-                        # By name, not ordinal
-                        rva32 = func_name_rva & 0xFFFFFFFF
-                        if rva32 + 2 < len(data):
-                            decrypt_data7(data, rva32 + 2, rva32 & 0xFF)
-                            w16(data, rva32, 0)  # clear hint
-                    thunk += 8
-                    func_count += 1
-                try:
-                    print(f'  DLL: {dll_name} ({func_count} functions)')
-                except (UnicodeEncodeError, UnicodeDecodeError):
-                    # Use ASCII-safe representation for problematic DLL names
-                    safe_name = dll_name.encode('ascii', errors='backslashreplace').decode('ascii')
-                    print(f'  DLL: {safe_name} ({func_count} functions)')
-                dll_count += 1
-                idt_pos += 20
-        print(f'  Total: {dll_count} DLLs')
+        # ---- .NET MetaData restore (CrackProof leaves it unencrypted) ----
+        # For .NET assemblies, CrackProof preserves the COR20 header + BSJB
+        # MetaData section in the protected file at their original RVA-mapped
+        # offsets - these regions are NOT covered by Stage 8 decompression.
+        # If the CLR data directory is non-zero, copy these regions verbatim
+        # from the protected file so DIE etc. can identify the assembly and
+        # mscoree._CorExeMain can find valid metadata.
+        clr_rva  = u32(data, exe_pe + 0xF8)
+        clr_size = u32(data, exe_pe + 0xFC)
+
+        def _prot_rva_to_off(rva):
+            """Map RVA -> file offset using the protected file's section table."""
+            nsec = u16(file_data, pe_header + 6)
+            opt  = u16(file_data, pe_header + 20)
+            tab  = pe_header + 24 + opt
+            for i in range(nsec):
+                s = tab + i * 40
+                va = u32(file_data, s + 12)
+                vs = u32(file_data, s + 8)
+                rsz = u32(file_data, s + 16)
+                rp = u32(file_data, s + 20)
+                if va <= rva < va + max(vs, rsz):
+                    return rp + (rva - va)
+            return None
+
+        if clr_rva and clr_size and clr_rva + clr_size <= len(data):
+            cor_off = _prot_rva_to_off(clr_rva)
+            if cor_off is not None and cor_off + 0x48 <= len(file_data):
+                # Verify it's a real COR20 header (cb field == 0x48).
+                if u32(file_data, cor_off) == 0x48:
+                    data[clr_rva:clr_rva + 0x48] = file_data[cor_off:cor_off + 0x48]
+                    md_rva  = u32(data, clr_rva + 0x08)
+                    md_size = u32(data, clr_rva + 0x0C)
+                    print(f'  .NET COR20 restored @ RVA=0x{clr_rva:X} MetaData=(0x{md_rva:X}, 0x{md_size:X})')
+                    if md_rva and md_size and md_rva + md_size <= len(data):
+                        md_off = _prot_rva_to_off(md_rva)
+                        if md_off is not None and md_off + md_size <= len(file_data):
+                            if file_data[md_off:md_off + 4] == b'BSJB':
+                                data[md_rva:md_rva + md_size] = file_data[md_off:md_off + md_size]
+                                print(f'  .NET BSJB MetaData restored @ RVA=0x{md_rva:X} size=0x{md_size:X}')
 
         # ---- Section table fixup ----
-        print('\n=== Section table fixup ===')
-        data[:0x1000] = file_data[:0x1000]
-        opt_hdr_size = u16(file_data, pe_header + 20)
-        sec_hdr = pe_header + 24 + opt_hdr_size
-
         export_va   = u32(clean_file_data, pe_header + 24 + opt_hdr_size - 128)
         export_size = u32(clean_file_data, pe_header + 24 + opt_hdr_size - 124)
         export_file_off = 0
         text_off = 0
         text_size = 0
-
+        sec_hdr = sec_hdr_base
         while u32(file_data, sec_hdr + 8) != 0:
-            va   = u32(file_data, sec_hdr + 12)
-            sz   = u32(file_data, sec_hdr + 8)
+            va    = u32(file_data, sec_hdr + 12)
+            sz    = u32(file_data, sec_hdr + 8)
             f_off = u32(file_data, sec_hdr + 20)
             sec_name = file_data[sec_hdr:sec_hdr + 8]
             if sec_name[:5] == b'.text':
-                text_size = sz
-                text_off = va
+                text_off, text_size = va, sz
             if export_va >= va and export_va + export_size <= va + sz:
                 export_file_off = export_va - va + f_off
-            # Fix SizeOfRawData = VirtualSize, PointerToRawData = VirtualAddress
+            # SizeOfRawData = VirtualSize, PointerToRawData = VirtualAddress
             w32(data, sec_hdr + 16, sz)
             w32(data, sec_hdr + 20, va)
-            # .rdata needs RW for IAT (loader writes resolved addresses)
+            # .rdata becomes RW so the loader can write the resolved IAT.
             if sec_name[:6] == b'.rdata':
-                w32(data, sec_hdr + 36, 0xC0000040)  # MEM_READ | MEM_WRITE | CNT_INITIALIZED_DATA
-            # Do NOT modify section characteristics (reference C# doesn't)
+                w32(data, sec_hdr + 36, 0xC0000040)
             sec_hdr += 40
 
         if export_size != 0 and export_file_off != 0:
             data[export_va:export_va + export_size] = file_data[export_file_off:export_file_off + export_size]
             print(f'  Restored export table at 0x{export_va:X}')
 
-        # ---- Decrypt .text section with decrypt_data8 (auto-detect key formula) ----
-        # CrackProof encrypts .text per-page with decrypt_data8, but different versions
-        # use different key formulas:
-        #   Formula A: key = page + 1  (newer CrackProof versions)
-        #   Formula B: key = 0x8000 * (page + 1)  (older CrackProof versions)
-        # Auto-detect: try each formula on the EP page, check if EP call target becomes
-        # a valid function prologue (sub rsp, XX pattern).
-        if is_layout_a and text_size > 0 and text_off > 0:
-            def apply_page_decrypt_data8(buf, t_off, page_idx, key_formula):
-                """Apply decrypt_data8 to a single page"""
+        # ---- .text decrypt_data8 (EXE only) -----------------------------
+        # Skip when EP == 0 (TLS-only) or when EP doesn't fall inside .text.
+        if text_size > 0 and text_off > 0 and text_off <= original_ep < text_off + text_size:
+            def _apply_d8_page(buf, t_off, page_idx, key_formula):
                 pk = key_formula(page_idx)
                 pa = t_off + page_idx * 0x1000
                 k = pk
-                rk = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
-                k = rk
+                k = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
                 for bi in range(1, 256):
                     rk = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
                     ri = (rk + bi) & 0xFFFFFFFF
@@ -1299,191 +1639,246 @@ def main():
                     tidx = pa + bi * 16 + (ri & 0xF)
                     buf[tidx] = (buf[tidx] ^ k) & 0xFF
 
-            def apply_full_text_decrypt_data8(buf, t_off, t_size, key_formula):
-                """Apply decrypt_data8 to entire .text"""
-                n_pages = t_size // 0x1000
-                for pg in range(n_pages):
-                    apply_page_decrypt_data8(buf, t_off, pg, key_formula)
+            # Auto-detect formula by checking which decrypt_data8 mutations
+            # land on 0xCC (compiler int3 padding) bytes. Counting 0xCC across
+            # the whole page is too noisy because most page bytes are not
+            # mutated. Instead we look at ONLY the 255 byte positions that
+            # decrypt_data8 modifies per page and ask: "did the formula turn
+            # this byte into 0xCC?" - the correct formula should hit int3 pads
+            # disproportionately often.
+            num_pages_total = text_size // 0x1000
+            sample_pages = []
+            for frac in (0.25, 0.5, 0.75):
+                pg = int(num_pages_total * frac)
+                if 0 < pg < num_pages_total:
+                    sample_pages.append(pg)
+            if not sample_pages and num_pages_total > 1:
+                sample_pages = [num_pages_total // 2]
 
-            def check_ep_quality(buf, ep_addr):
-                """Check if EP and its call target look like valid code. Returns score."""
-                if ep_addr + 10 > len(buf):
-                    return -1
-                score = 0
-                # Check EP prologue: sub rsp, 0x28; call rel32
-                if buf[ep_addr:ep_addr+4] == bytes([0x48, 0x83, 0xEC, 0x28]) and buf[ep_addr+4] == 0xE8:
-                    score += 10
-                    # Check call target
-                    rel32 = struct.unpack_from('<i', buf, ep_addr + 5)[0]
-                    ct = ep_addr + 9 + rel32
-                    if 0 < ct < len(buf) - 16:
-                        # Check if call target has sub rsp pattern: 48 83 EC XX
-                        for off in range(min(16, len(buf) - ct - 4)):
-                            if buf[ct+off] == 0x48 and buf[ct+off+1] == 0x83 and buf[ct+off+2] == 0xEC:
-                                score += 20
-                                break
-                        # Also accept: 48 89 5C ... pattern (common prologue)
-                        if buf[ct] == 0x48 and buf[ct+1] == 0x89:
-                            score += 5
-                return score
+            def _score_formula(ffunc):
+                """For each sample page, count how many decrypt_data8-mutated
+                positions become 0xCC after applying the formula."""
+                hits = 0
+                for sp in sample_pages:
+                    pg_off = text_off + sp * 0x1000
+                    src = data[pg_off:pg_off + 0x1000]
+                    if ffunc is None:
+                        # Baseline: how many of the would-be-mutated positions
+                        # are already 0xCC without any decryption?
+                        k = 1  # any non-zero so positions are reachable
+                        k = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
+                        # But we want to test the *positions* the real formula
+                        # would target. Without a real key we can't know them,
+                        # so for 'none' we use a uniform sample of positions:
+                        for bi in range(1, 256):
+                            tidx = bi * 16  # use first byte of each block
+                            if tidx < len(src) and src[tidx] == 0xCC:
+                                hits += 1
+                        continue
+                    k = ffunc(sp)
+                    k = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
+                    for bi in range(1, 256):
+                        rk = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
+                        ri = (rk + bi) & 0xFFFFFFFF
+                        k = (ri + bi) & 0xFFFFFFFF
+                        tidx = bi * 16 + (ri & 0xF)
+                        if tidx < len(src):
+                            mutated = src[tidx] ^ (k & 0xFF)
+                            if mutated == 0xCC:
+                                hits += 1
+                return hits
 
-            # Determine which pages to test (EP page + call target page)
-            ep_page = (peeked_ep - text_off) // 0x1000 if peeked_ep >= text_off else 0
-            test_pages = {ep_page}
-            # Also find call target page
-            if peeked_ep + 9 <= len(data) and data[peeked_ep + 4] == 0xE8:
-                rel32 = struct.unpack_from('<i', data, peeked_ep + 5)[0]
-                ct = peeked_ep + 9 + rel32
-                if ct >= text_off and ct < text_off + text_size:
-                    test_pages.add((ct - text_off) // 0x1000)
-
-            # Test three options on just the test pages
-            formulas = [
-                ('none', None),
+            none_hits = _score_formula(None)
+            best_score, best_name, best_formula = none_hits, 'none', None
+            for fname, ffunc in (
                 ('page+1', lambda p: p + 1),
                 ('0x8000*(page+1)', lambda p: 0x8000 * (p + 1)),
-            ]
-            best_score = -1
-            best_name = 'none'
-            best_formula = None
+            ):
+                hits = _score_formula(ffunc)
+                if hits > best_score:
+                    best_score, best_name, best_formula = hits, fname, ffunc
 
-            for fname, ffunc in formulas:
-                test_buf = bytearray(data)
-                if ffunc is not None:
-                    for pg in test_pages:
-                        apply_page_decrypt_data8(test_buf, text_off, pg, ffunc)
-                sc = check_ep_quality(test_buf, peeked_ep)
-                print(f'  decrypt_data8 {fname}: EP quality score = {sc}')
-                if sc > best_score:
-                    best_score = sc
-                    best_name = fname
-                    best_formula = ffunc
+            # If best formula doesn't clearly outscore the baseline by at
+            # least 2x, treat .text as already plaintext (no decrypt_data8).
+            # On real Layout-A samples the correct formula scores ~3-10x
+            # the baseline; on already-plaintext samples the formulas are
+            # statistical noise around the baseline.
+            if best_formula is not None and best_score < none_hits * 2:
+                print(f'  decrypt_data8 skipped: best={best_name} hits={best_score} '
+                      f'vs none={none_hits} (<2x baseline, already plaintext)')
+                best_formula = None
 
             if best_formula is not None:
-                print(f'\n=== Decrypting .text with decrypt_data8 (key={best_name}) ===')
-                apply_full_text_decrypt_data8(data, text_off, text_size, best_formula)
                 num_pages = text_size // 0x1000
-                print(f'  Decrypted {num_pages} pages')
+                for pg in range(num_pages):
+                    _apply_d8_page(data, text_off, pg, best_formula)
+                print(f'  decrypt_data8 ({best_name}, 0xCC score={best_score}): {num_pages} pages')
             else:
-                print(f'  .text already decrypted (best option: no decrypt_data8)')
+                print(f'  decrypt_data8: skipped (.text already decoded, 0xCC score={best_score})')
 
-        # ---- Metadata restore: EP + data directories from info[3] ----
-        # C# DLL ref: DecryptData5(info[3] + 16, 0x290)
-        #             EP = info[3] + 0x20
-        #             Data dirs: copy 0x80 bytes from info[3]+0x30 to pe+0x88
-        # For EXE: auto-detect Layout A vs B
-        #   Layout B (encrypted at +0x10): decrypt(info[3]+0x10, 0x290), EP at +0x20, dirs at +0x30
-        #   Layout A (plain at +0x10): decrypt(info[3]+0x40, 144), EP at +0x40, dirs at +0x50
-        print('\n=== Metadata restore ===')
-        exe_pe = u32(data, 60)
-        test_val = u32(data, info[3] + 0x10)
-
-        # Decrypt metadata and restore EP + data directories
-        if test_val > 0x10000:
-            # Layout B: decrypt info[3]+0x10 (0x290 bytes), EP at +0x20, dirs at +0x30
-            # Layout B metadata data directories are reliable - copy them
-            print(f'  Layout B: decrypting metadata at info[3]+0x10')
-            decrypt_data5(data, info[3] + 0x10, 0x290)
-            original_ep = u32(data, info[3] + 0x20)
-            for i in range(128):
-                data[exe_pe + 0x88 + i] = data[info[3] + 0x30 + i]
-        else:
-            # Layout A: decrypt info[3]+0x40 (144 bytes), EP at +0x40
-            print(f'  Layout A: decrypting metadata at info[3]+0x40')
-            decrypt_data5(data, info[3] + 0x40, 144)
-            original_ep = u32(data, info[3] + 0x40)
-            # Compare metadata data dirs with protected file PE header
-            dirs_name = ['Export','Import','Resource','Exception','Security','BaseReloc','Debug','Arch','GlobPtr','TLS','LoadCfg','BoundImp','IAT','DelayImp','CLR','Rsv']
-            for di in range(16):
-                meta_rva = u32(data, info[3] + 0x50 + di*8)
-                meta_sz  = u32(data, info[3] + 0x50 + di*8 + 4)
-                pe_rva   = u32(data, exe_pe + 0x88 + di*8)
-                pe_sz    = u32(data, exe_pe + 0x88 + di*8 + 4)
-                if meta_rva != pe_rva or meta_sz != pe_sz:
-                    print(f'  {dirs_name[di]}: PE=0x{pe_rva:X}/{pe_sz:X} META=0x{meta_rva:X}/{meta_sz:X}')
-            # Copy data dirs from metadata
-            for i in range(128):
-                data[exe_pe + 0x88 + i] = data[info[3] + 0x50 + i]
-
-        # Set entry point
-        w32(data, exe_pe + 40, original_ep)
-        print(f'  Entry point set to 0x{original_ep:X}')
-        
-        # Check if metadata overwrote Import Directory with 0
-        # If so, restore the value from "PE header restore" stage
-        current_import_rva = u32(data, exe_pe + 0x90)
-        current_import_size = u32(data, exe_pe + 0x94)
-        if current_import_rva == 0 and saved_import_rva > 0:
-            print(f'  Restoring Import Directory from PE header restore stage')
-            w32(data, exe_pe + 0x90, saved_import_rva)
-            w32(data, exe_pe + 0x94, saved_import_size)
-            print(f'  Import directory: RVA=0x{saved_import_rva:X} Size=0x{saved_import_size:X}')
-
-        # ALWAYS set import directory to the reconstructed IDT location
-        # BUT: only if import_table_ptr points to a VALID IDT (not garbage data)
-        # Validate by checking if the first IDT entry has a valid name RVA
-        import_table_is_valid = False
-        if import_table_ptr > 0 and import_table_ptr + 20 <= len(data):
-            first_name_rva = u32(data, import_table_ptr + 12)
-            if 0x1000 < first_name_rva < len(data):
-                # Check if name RVA points to a valid DLL name (ends with .dll or .DLL)
-                try:
-                    dll_name_bytes = data[first_name_rva:first_name_rva+50].split(b'\x00')[0]
-                    if len(dll_name_bytes) > 4 and (dll_name_bytes.lower().endswith(b'.dll') or dll_name_bytes.lower().endswith(b'.exe')):
-                        import_table_is_valid = True
-                except:
-                    pass
-        
-        if import_table_is_valid:
-            w32(data, exe_pe + 0x90, import_table_ptr)
-            idt_count = 0
-            iat_min = 0xFFFFFFFF
-            iat_max = 0
-            pos = import_table_ptr
+        # ---- decrypt_data7 on DLL/function names + IAT range -----------
+        dll_count = 0
+        iat_min, iat_max = 0xFFFFFFFF, 0
+        if import_rva_final:
+            pos = import_rva_final
             while pos + 20 <= len(data):
-                if u32(data, pos + 12) == 0:
+                name_rva = u32(data, pos + 12)
+                if name_rva == 0:
                     break
-                first_thunk = u32(data, pos + 16)
-                if first_thunk > 0 and first_thunk < len(data):
-                    if first_thunk < iat_min:
-                        iat_min = first_thunk
-                    # Walk thunks to find end
-                    tp = first_thunk
-                    while tp + 8 <= len(data):
-                        tv = u64(data, tp)
-                        if tv == 0:
-                            tp += 8
-                            break
-                        tp += 8
-                    if tp > iat_max:
-                        iat_max = tp
-                idt_count += 1
-                pos += 20
-            import_size = (idt_count + 1) * 20
-            w32(data, exe_pe + 0x94, import_size)
-            print(f'  Import directory: RVA=0x{import_table_ptr:X} Size=0x{import_size:X} ({idt_count} DLLs)')
+                if name_rva >= len(data):
+                    break
+                # Decrypt the DLL name unless it already reads as a clean
+                # plain-ASCII *.dll / *.exe string (some samples ship the IDT
+                # in plain text already - e.g. SEGA system components).
+                end = data.find(b'\x00', name_rva, name_rva + 64)
+                already_plain = False
+                if end > name_rva and end - name_rva <= 60:
+                    s = bytes(data[name_rva:end])
+                    if all(0x20 <= b < 0x7F for b in s):
+                        low = s.lower()
+                        if low.endswith(b'.dll') or low.endswith(b'.exe'):
+                            already_plain = True
+                if not already_plain:
+                    decrypt_data7(data, name_rva, name_rva & 0xFF)
+                # Normalize to lowercase: 'KeRnEl32.dLl' -> 'kernel32.dll'.
+                end = data.find(b'\x00', name_rva, name_rva + 64)
+                if end > name_rva:
+                    s = bytes(data[name_rva:end])
+                    if all(0x20 <= b < 0x7F for b in s):
+                        data[name_rva:end] = s.lower()
 
-            # Set IAT data directory from FirstThunk ranges
+                oft = u32(data, pos)
+                ift = u32(data, pos + 16)
+                thunk = oft if oft else ift
+                if 0 < ift < len(data):
+                    iat_min = min(iat_min, ift)
+
+                while thunk and thunk + 8 <= len(data):
+                    v = u64(data, thunk)
+                    if v == 0:
+                        break
+                    if not (v & 0x8000000000000000):
+                        r = v & 0xFFFFFFFF
+                        if r + 2 < len(data):
+                            # Decrypt unless the function name reads as plain ASCII.
+                            fend = data.find(b'\x00', r + 2, r + 2 + 256)
+                            already = False
+                            if fend > r + 2 and fend - (r + 2) <= 250:
+                                fs = bytes(data[r + 2:fend])
+                                if all(0x20 <= b < 0x7F for b in fs):
+                                    already = True
+                            if not already:
+                                decrypt_data7(data, r + 2, r & 0xFF)
+                                w16(data, r, 0)
+                    thunk += 8
+                if 0 < ift < len(data):
+                    tp = ift
+                    while tp + 8 <= len(data):
+                        v2 = u64(data, tp)
+                        tp += 8
+                        if v2 == 0:
+                            break
+                    iat_max = max(iat_max, tp)
+                dll_count += 1
+                pos += 20
+
+            if import_size_final == 0:
+                import_size_final = (dll_count + 1) * 20
+                w32(data, exe_pe + 0x94, import_size_final)
             if iat_min < iat_max:
                 w32(data, exe_pe + 0xE8, iat_min)
                 w32(data, exe_pe + 0xEC, iat_max - iat_min)
-                print(f'  IAT directory: RVA=0x{iat_min:X} Size=0x{iat_max - iat_min:X}')
 
-        # Fix PE header fields (match old working script)
-        w16(data, exe_pe + 92, 3)   # Subsystem = CUI
-        w16(data, exe_pe + 94, 0)   # DllCharacteristics = 0
-        print(f'  Set Subsystem=3 (CUI), DllCharacteristics=0')
+            # CrackProof zeroes the original EP for some SEGA system components
+            # (sgxsegaboot.exe / sgosupdate.exe) that look .NET-stubbed
+            # (mscoree import + COR20 dir). The metadata stores EP == 0 which
+            # the PE loader rejects with STATUS_INVALID_IMAGE_FORMAT for GUI
+            # EXEs. We patch a 6-byte `jmp [mscoree IAT slot]` stub at the
+            # start of .text (Stage 8 leaves that region zero-filled) and
+            # point EP at the stub so the loader can dispatch to
+            # mscoree._CorExeMain. Combined with the cleared COR20 dir below,
+            # _CorExeMain returns cleanly when it sees no managed metadata.
+            if original_ep == 0:
+                # Find the mscoree IAT slot RVA.
+                mscoree_iat = 0
+                pos = import_rva_final
+                while pos + 20 <= len(data):
+                    n_rva = u32(data, pos + 12)
+                    if n_rva == 0:
+                        break
+                    nm = data[n_rva:n_rva + 32].split(b'\x00', 1)[0]
+                    if nm.lower() == b'mscoree.dll':
+                        mscoree_iat = u32(data, pos + 16)
+                        break
+                    pos += 20
 
-        # Zero out BaseReloc directory
+                if mscoree_iat:
+                    # Locate the .text section RVA/size.
+                    sec = sec_hdr_base
+                    text_rva, text_vs = 0, 0
+                    while u32(file_data, sec + 8) != 0:
+                        if file_data[sec:sec + 5] == b'.text':
+                            text_vs   = u32(file_data, sec + 8)
+                            text_rva  = u32(file_data, sec + 12)
+                            break
+                        sec += 40
+                    # Stub: FF 25 disp32 -> jmp qword ptr [mscoree_iat]
+                    if text_rva and text_vs > 6:
+                        stub_off = text_rva
+                        disp32 = (mscoree_iat - (stub_off + 6)) & 0xFFFFFFFF
+                        data[stub_off:stub_off + 2] = b'\xFF\x25'
+                        struct.pack_into('<I', data, stub_off + 2, disp32)
+                        w32(data, exe_pe + 40, stub_off)
+                        original_ep = stub_off
+                        print(f'  EP=0 -> .text+0x0 jump stub -> mscoree IAT @ 0x{mscoree_iat:X}')
+
+        # CrackProof's metadata sometimes leaves a fake CLR (COR20) directory
+        # entry pointing at a never-populated header (cb == 0). If we leave it
+        # in place, the PE loader treats the image as a managed assembly and
+        # hands control to mscoree._CorExeMain, which then crashes reading
+        # the empty header (STATUS_DLL_INIT_FAILED). Clearing the directory
+        # makes the loader treat the image as native and call our EP stub
+        # instead.
+        cor20_dir_off = exe_pe + 0xF8
+        cor20_rva = u32(data, cor20_dir_off)
+        if cor20_rva and cor20_rva + 4 <= len(data):
+            if u32(data, cor20_rva) == 0:
+                w32(data, cor20_dir_off, 0)
+                w32(data, cor20_dir_off + 4, 0)
+
+        # Same defensive cleanup for the TLS directory. When metadata stores
+        # a TLS dir RVA whose IMAGE_TLS_DIRECTORY64 target is zero-filled
+        # (RawStart/End/Index/Callbacks all 0), the PE loader's
+        # LdrpAllocateTlsEntry dereferences NULL during process init and
+        # raises STATUS_ACCESS_VIOLATION (0xC0000005) before EP runs.
+        # Observed on sgxmaster.exe variants. Clearing the directory makes
+        # the loader skip static-TLS handling.
+        tls_dir_off = exe_pe + 0xD0
+        tls_rva = u32(data, tls_dir_off)
+        if tls_rva and tls_rva + 24 <= len(data):
+            raw_start = u64(data, tls_rva)
+            raw_end   = u64(data, tls_rva + 8)
+            cb_addr   = u64(data, tls_rva + 16)
+            if raw_start == 0 and raw_end == 0 and cb_addr == 0:
+                w32(data, tls_dir_off, 0)
+                w32(data, tls_dir_off + 4, 0)
+
+        print(f'  Total: {dll_count} DLLs, Import RVA=0x{import_rva_final:X} Size=0x{import_size_final:X}')
+
+        # Subsystem - keep the value supplied by the protected file's PE header
+        # (CrackProof preserves it). DllCharacteristics zeroed because the
+        # protected stub uses none. BaseReloc dir is cleared: CrackProof did
+        # not preserve a valid base-relocation table - the metadata's value
+        # tends to point into .fptable, and .reloc itself holds CrackProof
+        # data not reloc blocks. Most CrackProof'd binaries are /FIXED so the
+        # loader doesn't need relocations.
+        w16(data, exe_pe + 94, 0)
         w32(data, exe_pe + 0xB0, 0)
         w32(data, exe_pe + 0xB4, 0)
 
         # ---- Write output ----
         dot = in_file.rfind('.')
-        if dot >= 0:
-            out_file = in_file[:dot] + '.unpack' + in_file[dot:]
-        else:
-            out_file = in_file + '.unpack'
+        out_file = in_file[:dot] + '.unpack' + in_file[dot:] if dot >= 0 else in_file + '.unpack'
         print(f'\n=== Writing {out_file} ===')
         with open(out_file, 'wb') as f:
             f.write(data)
@@ -1773,7 +2168,22 @@ def main():
             if decoded[0] in valid_opcodes and 0xC3 in decoded:
                 lfsr_candidates.append(scan_off)
         if lfsr_candidates:
-            lfsr_off = min(lfsr_candidates, key=lambda c: abs(c - off_file_lfsr))
+            # The real file LFSR lives at or just *before* off_file_lfsr in every
+            # observed sample (delta in {0, -0x20}). False positives (other LFSR
+            # blocks used elsewhere) sit after it with a smaller |delta|, which
+            # the legacy "closest absolute" rule misses. Prefer exact, then the
+            # smallest negative delta, fall back to the smallest positive.
+            exact = [c for c in lfsr_candidates if c == off_file_lfsr]
+            negatives = sorted([c for c in lfsr_candidates if c < off_file_lfsr],
+                               key=lambda c: off_file_lfsr - c)
+            positives = sorted([c for c in lfsr_candidates if c > off_file_lfsr],
+                               key=lambda c: c - off_file_lfsr)
+            if exact:
+                lfsr_off = exact[0]
+            elif negatives:
+                lfsr_off = negatives[0]
+            else:
+                lfsr_off = positives[0]
             print(f'  fileLFSR adjusted: eighth+0x{lfsr_off:X} (expected 0x{off_file_lfsr:X}, {len(lfsr_candidates)} candidates)')
         else:
             print('ERROR: could not locate file LFSR in eighthStage')
@@ -2091,31 +2501,31 @@ def main():
     # NOTE: This post-processing is ONLY needed for specific files (e.g., chusanApp_2.00_odd_orig.exe)
     # For most files, it will BREAK the executable. Disabled by default.
     ENABLE_POST_PROCESSING = False
-    
+
     if ENABLE_POST_PROCESSING:
         print(f'\n=== Post-processing to match reference output ===')
-        
+
         # Step 1: Parse current import table and collect all DLLs/functions
         print('Step 1: Parsing import table...')
         current_import_rva = u32(data, exe_pe + 0x80)
         current_import_size = u32(data, exe_pe + 0x84)
-        
+
         dll_list = []
         if 0 < current_import_rva < len(data) and current_import_size > 0:
             idt_pos = current_import_rva
             idt_end = current_import_rva + current_import_size
-            
+
             while idt_pos + 20 <= idt_end and idt_pos + 20 <= len(data):
                 ilt_rva = u32(data, idt_pos)
                 name_rva = u32(data, idt_pos + 12)
                 iat_rva = u32(data, idt_pos + 16)
-                
+
                 if ilt_rva == 0 and name_rva == 0 and iat_rva == 0:
                     break
-                
+
                 if 0 < name_rva < len(data):
                     dll_name = get_string(data, name_rva)
-                    
+
                     # Collect functions
                     functions = []
                     thunk_pos = ilt_rva if (0 < ilt_rva < len(data)) else iat_rva
@@ -2124,7 +2534,7 @@ def main():
                             thunk_val = u32(data, thunk_pos)
                             if thunk_val == 0:
                                 break
-                            
+
                             if thunk_val & 0x80000000:
                                 # Import by ordinal
                                 ordinal = thunk_val & 0xFFFF
@@ -2134,49 +2544,49 @@ def main():
                                 if thunk_val + 2 < len(data):
                                     func_name = get_string(data, thunk_val + 2)
                                     functions.append(('name', func_name))
-                            
+
                             thunk_pos += 4
-                    
+
                     dll_list.append({
                         'name': dll_name,
                         'functions': functions,
                         'ilt_rva': ilt_rva,
                         'iat_rva': iat_rva
                     })
-                
+
                 idt_pos += 20
-            
+
             print(f'  Found {len(dll_list)} DLLs')
-        
+
         # Step 2: Normalize and sort DLLs
         print('Step 2: Normalizing DLL names...')
         dll_mapping = {
             'ole32.dll': 'combase.dll',
             'crypt32.dll': 'dpapi.dll'
         }
-        
+
         for dll in dll_list:
             orig_name = dll['name']
             lower_name = orig_name.lower()
-            
+
             # Apply mapping
             if lower_name in dll_mapping:
                 dll['name'] = dll_mapping[lower_name]
                 print(f'  Mapped: {orig_name} -> {dll["name"]}')
             else:
                 dll['name'] = lower_name
-        
+
         # Sort by name
         dll_list.sort(key=lambda d: d['name'])
         print(f'  Sorted {len(dll_list)} DLLs alphabetically')
-        
+
         # Step 3: Extend sections
         print('Step 3: Extending sections...')
-        
+
         num_sections = u16(data, exe_pe + 6)
         opt_hdr_size = u16(data, exe_pe + 20)
         sec_table = exe_pe + 24 + opt_hdr_size
-        
+
         # Find section indices
         text_idx = -1
         rdata_idx = -1
@@ -2184,7 +2594,7 @@ def main():
         idata_idx = -1
         tls_idx = -1
         rsrc_idx = -1
-        
+
         for i in range(num_sections):
             sec_off = sec_table + i * 40
             sec_name = data[sec_off:sec_off+8]
@@ -2200,26 +2610,26 @@ def main():
                 tls_idx = i
             elif sec_name[:5] == b'.rsrc':
                 rsrc_idx = i
-        
+
         # Extend .text section (+0x7000)
         if text_idx >= 0:
             text_sec = sec_table + text_idx * 40
             old_text_vsize = u32(data, text_sec + 8)
             old_text_vaddr = u32(data, text_sec + 12)
             new_text_vsize = old_text_vsize + 0x7000
-            
+
             print(f'  .text: 0x{old_text_vsize:08X} -> 0x{new_text_vsize:08X} (+0x7000)')
-            
+
             # Insert 0x7000 bytes at end of .text
             text_end = old_text_vaddr + old_text_vsize
             data[text_end:text_end] = bytearray(0x7000)
             for i in range(0x7000):
                 data[text_end + i] = 0xCC
-            
+
             # Update section header
             w32(data, text_sec + 8, new_text_vsize)
             w32(data, text_sec + 16, new_text_vsize)
-        
+
         # Extend .rdata section (+0x1000)
         if rdata_idx >= 0:
             rdata_sec = sec_table + rdata_idx * 40
@@ -2227,19 +2637,19 @@ def main():
             old_rdata_vaddr = u32(data, rdata_sec + 12)
             new_rdata_vaddr = old_rdata_vaddr + 0x7000
             new_rdata_vsize = old_rdata_vsize + 0x1000
-            
+
             print(f'  .rdata: VAddr 0x{old_rdata_vaddr:08X} -> 0x{new_rdata_vaddr:08X}, VSize 0x{old_rdata_vsize:08X} -> 0x{new_rdata_vsize:08X}')
-            
+
             # Insert 0x1000 bytes at end of .rdata
             rdata_end = old_rdata_vaddr + old_rdata_vsize + 0x7000
             data[rdata_end:rdata_end] = bytearray(0x1000)
-            
+
             # Update section header
             w32(data, rdata_sec + 8, new_rdata_vsize)
             w32(data, rdata_sec + 12, new_rdata_vaddr)
             w32(data, rdata_sec + 16, new_rdata_vsize)
             w32(data, rdata_sec + 20, new_rdata_vaddr)
-        
+
         # Extend .tls section (+0x1000)
         if tls_idx >= 0:
             tls_sec = sec_table + tls_idx * 40
@@ -2247,34 +2657,34 @@ def main():
             old_tls_vaddr = u32(data, tls_sec + 12)
             new_tls_vaddr = old_tls_vaddr + 0x8000
             new_tls_vsize = old_tls_vsize + 0x1000
-            
+
             print(f'  .tls: VAddr 0x{old_tls_vaddr:08X} -> 0x{new_tls_vaddr:08X}, VSize 0x{old_tls_vsize:08X} -> 0x{new_tls_vsize:08X}')
-            
+
             # Insert 0x1000 bytes at end of .tls
             tls_end = old_tls_vaddr + old_tls_vsize + 0x8000
             data[tls_end:tls_end] = bytearray(0x1000)
-            
+
             # Update section header
             w32(data, tls_sec + 8, new_tls_vsize)
             w32(data, tls_sec + 12, new_tls_vaddr)
             w32(data, tls_sec + 16, new_tls_vsize)
             w32(data, tls_sec + 20, new_tls_vaddr)
-        
+
         # Step 4: Adjust subsequent sections
         print('Step 4: Adjusting section RVAs...')
-        
+
         for i in range(num_sections):
             sec_off = sec_table + i * 40
             sec_name = data[sec_off:sec_off+8]
             old_vaddr = u32(data, sec_off + 12)
-            
+
             # .data and old .idata are before .tls: +0x8000
             if i == data_idx or i == idata_idx:
                 new_vaddr = old_vaddr + 0x8000
                 w32(data, sec_off + 12, new_vaddr)
                 w32(data, sec_off + 20, new_vaddr)
                 print(f'  Section [{i}] {sec_name[:8].decode("ascii", errors="replace"):8s}: 0x{old_vaddr:08X} -> 0x{new_vaddr:08X} (+0x8000)')
-            
+
             # .rsrc (will be renamed to peC\0c) is after .tls: +0x9000
             elif i == rsrc_idx:
                 new_vaddr = old_vaddr + 0x9000
@@ -2283,11 +2693,11 @@ def main():
                 # Rename to "peC\0c"
                 data[sec_off:sec_off+8] = b'peC\x00c\x00\x00\x00'
                 print(f'  Section [{i}] renamed to "peC\\0c": 0x{old_vaddr:08X} -> 0x{new_vaddr:08X} (+0x9000)')
-        
+
         # Adjust IAT RVAs in dll_list to match new section positions
         # IAT is in the old .idata section, which was shifted by +0x8000
         print('Step 4.5: Adjusting IAT RVAs in dll_list...')
-        
+
         # Get old .idata section address range
         old_idata_start = 0
         old_idata_end = 0
@@ -2297,7 +2707,7 @@ def main():
             old_idata_vsize = u32(data, old_idata_sec + 8)
             old_idata_end = old_idata_start + old_idata_vsize
             print(f'  Old .idata range: 0x{old_idata_start:08X} - 0x{old_idata_end:08X}')
-        
+
         for dll in dll_list:
             old_iat = dll['iat_rva']
             # IAT is in the old .idata section
@@ -2305,10 +2715,10 @@ def main():
             if old_idata_start <= old_iat < old_idata_end:
                 dll['iat_rva'] = old_iat + 0x8000
                 print(f'  {dll["name"]:20s}: IAT 0x{old_iat:08X} -> 0x{dll["iat_rva"]:08X}')
-        
+
         # Step 5: Create new section [6] .idata
         print('Step 5: Creating new .idata section...')
-        
+
         # Calculate new .idata RVA (after peC\0c section)
         if rsrc_idx >= 0:
             rsrc_sec = sec_table + rsrc_idx * 40
@@ -2317,19 +2727,19 @@ def main():
             new_idata_rva = rsrc_vaddr + rsrc_vsize
         else:
             new_idata_rva = 0x022AE000  # Fallback
-        
+
         new_idata_size = 0x7000
-        
+
         print(f'  New .idata: RVA=0x{new_idata_rva:08X}, Size=0x{new_idata_size:08X}')
-        
+
         # Ensure we have space for new section header
         # Add new section header at the end of section table
         new_sec_off = sec_table + num_sections * 40
-        
+
         # Make sure there's space (expand if needed)
         if new_sec_off + 40 > len(data):
             data.extend(bytearray(40))
-        
+
         # Write new section header
         data[new_sec_off:new_sec_off+8] = b'.idata\x00\x00'
         w32(data, new_sec_off + 8, new_idata_size)  # VirtualSize
@@ -2341,71 +2751,71 @@ def main():
         w16(data, new_sec_off + 32, 0)  # NumberOfRelocations
         w16(data, new_sec_off + 34, 0)  # NumberOfLinenumbers
         w32(data, new_sec_off + 36, 0x40000040)  # Characteristics (INITIALIZED_DATA | READ)
-        
+
         # Update section count
         w16(data, exe_pe + 6, num_sections + 1)
-        
+
         # Step 6: Rebuild import table in new .idata section
         print('Step 6: Rebuilding import table...')
-        
+
         # Ensure new .idata section exists in file
         if new_idata_rva + new_idata_size > len(data):
             data.extend(bytearray(new_idata_rva + new_idata_size - len(data)))
-        
+
         # Clear new .idata section
         data[new_idata_rva:new_idata_rva + new_idata_size] = bytearray(new_idata_size)
-        
+
         # Build IDT (Import Directory Table)
         num_dlls = len(dll_list)
         idt_size = (num_dlls + 1) * 20  # +1 for null terminator
-        
+
         # Layout: IDT | OFTs | Names | DLL names
         idt_start = new_idata_rva
         oft_start = idt_start + idt_size
-        
+
         # Calculate space needed
         oft_offset = oft_start
         name_offset = oft_start
-        
+
         # Calculate OFT space (function pointers)
         for dll in dll_list:
             name_offset += (len(dll['functions']) + 1) * 4  # +1 for null terminator
-        
+
         # Calculate function name strings space
         func_name_offset = name_offset
         for dll in dll_list:
             for func in dll['functions']:
                 if func[0] == 'name':
                     func_name_offset += 2 + len(func[1]) + 1  # hint(2) + name + null
-        
+
         dll_name_offset = func_name_offset
-        
+
         # Write IDT and build import data
         for idx, dll in enumerate(dll_list):
             idt_entry = idt_start + idx * 20
-            
+
             # OriginalFirstThunk (OFT)
             oft_rva = oft_offset
             w32(data, idt_entry, oft_rva)
-            
+
             # TimeDateStamp
             w32(data, idt_entry + 4, 0)
-            
+
             # ForwarderChain
             w32(data, idt_entry + 8, 0)
-            
+
             # Name RVA
             dll_name_rva = dll_name_offset
             w32(data, idt_entry + 12, dll_name_rva)
-            
+
             # FirstThunk (use original IAT RVA)
             w32(data, idt_entry + 16, dll['iat_rva'])
-            
+
             # Write DLL name
             dll_name_bytes = dll['name'].encode('ascii') + b'\x00'
             data[dll_name_rva:dll_name_rva + len(dll_name_bytes)] = dll_name_bytes
             dll_name_offset += len(dll_name_bytes)
-            
+
             # Write OFT entries
             for func in dll['functions']:
                 if func[0] == 'ordinal':
@@ -2415,66 +2825,66 @@ def main():
                     # Import by name
                     func_name_rva = name_offset
                     w32(data, oft_offset, func_name_rva)
-                    
+
                     # Write hint (0) and function name
                     w16(data, func_name_rva, 0)
                     func_name_bytes = func[1].encode('ascii') + b'\x00'
                     data[func_name_rva + 2:func_name_rva + 2 + len(func_name_bytes)] = func_name_bytes
                     name_offset += 2 + len(func_name_bytes)
-                
+
                 oft_offset += 4
-            
+
             # Null terminator for OFT
             w32(data, oft_offset, 0)
             oft_offset += 4
-        
+
         # Null terminator for IDT
         for i in range(20):
             data[idt_start + num_dlls * 20 + i] = 0
-        
+
         print(f'  Rebuilt import table with {num_dlls} DLLs')
-        
+
         # Step 7: Clear old .idata section
         if idata_idx >= 0:
             old_idata_sec = sec_table + idata_idx * 40
             old_idata_vaddr = u32(data, old_idata_sec + 12)
             old_idata_vsize = u32(data, old_idata_sec + 8)
-            
+
             print(f'Step 7: Clearing old .idata at 0x{old_idata_vaddr:08X} (size=0x{old_idata_vsize:08X})')
             data[old_idata_vaddr:old_idata_vaddr + old_idata_vsize] = bytearray(old_idata_vsize)
-        
+
         # Step 8: Update data directories
         print('Step 8: Updating data directories...')
-        
+
         # Import Directory
         w32(data, exe_pe + 0x80, new_idata_rva)
         w32(data, exe_pe + 0x84, idt_size)
         print(f'  Import Directory: RVA=0x{new_idata_rva:08X} Size=0x{idt_size:08X}')
-        
+
         # Adjust other data directories
         dd_base = exe_pe + 24 + 96
-        
+
         # Export (index 0)
         old_export_rva = u32(data, dd_base)
         if old_export_rva > 0:
             new_export_rva = old_export_rva + 0x9000
             w32(data, dd_base, new_export_rva)
             print(f'  Export: 0x{old_export_rva:08X} -> 0x{new_export_rva:08X}')
-        
+
         # Resource (index 2)
         old_resource_rva = u32(data, dd_base + 2 * 8)
         if old_resource_rva > 0:
             new_resource_rva = old_resource_rva + 0x9000
             w32(data, dd_base + 2 * 8, new_resource_rva)
             print(f'  Resource: 0x{old_resource_rva:08X} -> 0x{new_resource_rva:08X}')
-        
+
         # Debug (index 6)
         old_debug_rva = u32(data, dd_base + 6 * 8)
         if old_debug_rva > 0:
             new_debug_rva = old_debug_rva + 0x9000
             w32(data, dd_base + 6 * 8, new_debug_rva)
             print(f'  Debug: 0x{old_debug_rva:08X} -> 0x{new_debug_rva:08X}')
-        
+
         # Step 9: Adjust entry point
         print('Step 9: Adjusting entry point...')
         old_ep = u32(data, exe_pe + 40)
@@ -2482,7 +2892,7 @@ def main():
         new_ep = old_ep + 0x4880
         w32(data, exe_pe + 40, new_ep)
         print(f'  Entry Point: 0x{old_ep:08X} -> 0x{new_ep:08X} (+0x4880)')
-        
+
         # Step 10: Update ImageSize
         print('Step 10: Updating ImageSize...')
         old_image_size = u32(data, exe_pe + 80)
@@ -2497,6 +2907,10 @@ def main():
     else:
         out_file = in_file + '.unpack'
     print(f'\n=== Writing {out_file} ===')
+    if is_pe32:
+        if not pe32_imports_already_match_idata_layout(data, pe_header):
+            data = move_pe32_imports_to_kmiat(data, pe_header)
+        data = compact_memory_image_to_pe(data, pe_header)
     with open(out_file, 'wb') as f:
         f.write(data)
     print(f'Done! {_elapsed()}')
