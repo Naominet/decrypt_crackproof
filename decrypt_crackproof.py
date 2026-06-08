@@ -1,6 +1,9 @@
 import struct
 import os
 import sys
+import zlib
+import array
+import time as _time
 
 # ============================================================
 # CrackProof Shell Unpacker (DLL + EXE, PE32 + PE32+)
@@ -8,70 +11,63 @@ import sys
 # Reference: DecryptCrackproofDll64 (C#)
 # ============================================================
 
+_t0 = _time.perf_counter()
+def _elapsed():
+    return f'[{_time.perf_counter()-_t0:.2f}s]'
+
 # ---------- helpers ----------
+_u16 = struct.Struct('<H')
+_u32 = struct.Struct('<I')
+_u64 = struct.Struct('<Q')
+
 def u8(data, off):
     return data[off]
 
 def u16(data, off):
-    return struct.unpack_from('<H', data, off)[0]
+    return _u16.unpack_from(data, off)[0]
 
 def u32(data, off):
-    return struct.unpack_from('<I', data, off)[0]
+    return _u32.unpack_from(data, off)[0]
 
 def u64(data, off):
-    return struct.unpack_from('<Q', data, off)[0]
+    return _u64.unpack_from(data, off)[0]
 
 def w8(data, off, val):
     data[off] = val & 0xFF
 
 def w16(data, off, val):
-    struct.pack_into('<H', data, off, val & 0xFFFF)
+    _u16.pack_into(data, off, val & 0xFFFF)
 
 def w32(data, off, val):
-    struct.pack_into('<I', data, off, val & 0xFFFFFFFF)
+    _u32.pack_into(data, off, val & 0xFFFFFFFF)
 
 def w64(data, off, val):
-    struct.pack_into('<Q', data, off, val & 0xFFFFFFFFFFFFFFFF)
+    _u64.pack_into(data, off, val & 0xFFFFFFFFFFFFFFFF)
 
 def bswap32(v):
-    return struct.unpack('>I', struct.pack('<I', v & 0xFFFFFFFF))[0]
+    return int.from_bytes((v & 0xFFFFFFFF).to_bytes(4, 'little'), 'big')
+
+# Pre-built ror8/rol8 lookup tables: _ROR8[shift][byte], _ROL8[shift][byte]
+_ROR8 = [[0]*256 for _ in range(8)]
+_ROL8 = [[0]*256 for _ in range(8)]
+for _s in range(8):
+    for _b in range(256):
+        _ROR8[_s][_b] = ((_b >> _s) | (_b << (8 - _s))) & 0xFF
+        _ROL8[_s][_b] = ((_b << _s) | (_b >> (8 - _s))) & 0xFF
 
 def ror8(b, n):
-    n &= 7
-    return ((b >> n) | (b << (8 - n))) & 0xFF
+    return _ROR8[n & 7][b]
 
 def rol8(b, n):
-    n &= 7
-    return ((b << n) | (b >> (8 - n))) & 0xFF
+    return _ROL8[n & 7][b]
 
 def get_string(data, off):
-    end = off
-    while end < len(data) and data[end] != 0:
-        end += 1
+    end = data.index(0, off) if 0 in data[off:off+512] else off + 512
     return data[off:end].decode('ascii', errors='replace')
 
-# ---------- CRC32 ----------
-_crc_table = None
-def _init_crc():
-    global _crc_table
-    if _crc_table is not None:
-        return
-    _crc_table = []
-    for i in range(256):
-        c = i
-        for _ in range(8):
-            if c & 1:
-                c = 0xEDB88320 ^ (c >> 1)
-            else:
-                c >>= 1
-        _crc_table.append(c & 0xFFFFFFFF)
-
+# ---------- CRC32 (use zlib C implementation) ----------
 def crc32(data, offset, size, init=0):
-    _init_crc()
-    crc = init ^ 0xFFFFFFFF
-    for i in range(size):
-        crc = _crc_table[(crc ^ data[offset + i]) & 0xFF] ^ (crc >> 8)
-    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+    return zlib.crc32(data[offset:offset + size], init) & 0xFFFFFFFF
 
 def checksum_with_size_xor(data, addr):
     off = u32(data, addr)
@@ -94,12 +90,13 @@ def decrypt_data2(file_data, data, info, decrypt_size):
     offset = info[4] + 4096
     tmp = (info[0] + (~decrypt_size & 0xFFFFFFFF)) & 0xFFFFFFFF
     count = decrypt_size >> 2
+    # Batch read source dwords
+    src_bytes = file_data[offset:offset + count * 4]
+    vals = struct.unpack_from(f'<{count}I', src_bytes, 0)
+    dst_off = info[3]
     for i in range(count):
-        idx = i * 4
-        d_off = offset + idx
-        w_off = info[3] + idx
-        val = u32(file_data, d_off)
-        w32(data, w_off, tmp ^ val)
+        val = vals[i]
+        _u32.pack_into(data, dst_off + i * 4, (tmp ^ val) & 0xFFFFFFFF)
         tmp = ((i * i) ^ ((tmp + val + i) & 0xFFFFFFFF)) & 0xFFFFFFFF
 
 def decrypt_data3(data, data_offset, key, shift):
@@ -107,39 +104,71 @@ def decrypt_data3(data, data_offset, key, shift):
     sz = u32(data, data_offset + 4)
     rev = 32 - shift
     count = sz >> 2
+    M = 0xFFFFFFFF
     for i in range(count):
         addr = off + i * 4
-        val = u32(data, addr) ^ key
-        key = (key + i) & 0xFFFFFFFF
-        val = (((val >> shift) | (val << rev)) & 0xFFFFFFFF)
-        val = (val - i) & 0xFFFFFFFF
-        w32(data, addr, val)
+        val = _u32.unpack_from(data, addr)[0] ^ key
+        key = (key + i) & M
+        val = (((val >> shift) | (val << rev)) & M)
+        val = (val - i) & M
+        _u32.pack_into(data, addr, val)
+
+# Pre-build decrypt_data4 transform: ror5(b) ^ key2 -> ror5 -> ^ key1 -> ror5
+# Since keys cycle 0-255, pre-build 256 full-byte LUTs for decrypt_data4 and decrypt_data5
+_d4_lut = None  # [key1][key2][byte] -> result
+_d5_lut = None
+
+def _build_d4_lut():
+    global _d4_lut
+    if _d4_lut is not None:
+        return
+    ror5 = _ROR8[5]
+    _d4_lut = [[None]*256 for _ in range(256)]
+    for k1 in range(256):
+        for k2 in range(256):
+            tbl = bytearray(256)
+            for b in range(256):
+                v = ror5[b] ^ k2
+                v = ror5[v] ^ k1
+                v = ror5[v]
+                tbl[b] = v
+            _d4_lut[k1][k2] = tbl
+
+def _build_d5_lut():
+    global _d5_lut
+    if _d5_lut is not None:
+        return
+    ror6 = _ROR8[6]
+    _d5_lut = [[None]*256 for _ in range(256)]
+    for k1 in range(256):
+        for k2 in range(256):
+            tbl = bytearray(256)
+            for b in range(256):
+                v = ror6[b] ^ k2
+                v = ror6[v] ^ k1
+                v = ror6[v]
+                tbl[b] = v
+            _d5_lut[k1][k2] = tbl
 
 def decrypt_data4(data, data_offset):
+    _build_d4_lut()
     va = u32(data, data_offset)
     sz = u32(data, data_offset + 4)
     key1 = ((va >> 8) + va) & 0xFF
     key2 = (key1 + 1) & 0xFF
     for i in range(sz):
-        addr = va + i
-        b = data[addr]
-        b = ror8(b, 5) ^ key2
-        b = ror8(b, 5) ^ key1
-        b = ror8(b, 5)
-        data[addr] = b
+        tbl = _d4_lut[key1][key2]
+        data[va + i] = tbl[data[va + i]]
         key1 = (key1 + 1) & 0xFF
         key2 = (key2 + 1) & 0xFF
 
 def decrypt_data5(data, va, size):
+    _build_d5_lut()
     key1 = va & 0xFF
     key2 = (key1 + 1) & 0xFF
     for i in range(size):
-        addr = va + i
-        b = data[addr]
-        b = ror8(b, 6) ^ key2
-        b = ror8(b, 6) ^ key1
-        b = ror8(b, 6)
-        data[addr] = b
+        tbl = _d5_lut[key1][key2]
+        data[va + i] = tbl[data[va + i]]
         key1 = (key1 + 1) & 0xFF
         key2 = (key2 + 1) & 0xFF
 
@@ -180,50 +209,66 @@ def decrypt_data8(data, data_offset, size, key):
         tidx = data_offset + i * 16 + (ri & 0xF)
         data[tidx] = (data[tidx] ^ key) & 0xFF
 
-# ---------- AES ----------
-colum_mix1 = colum_mix2 = colum_mix3 = colum_mix4 = aes_sbox = None
+# ---------- AES (optimized: array.array for direct indexing) ----------
+_cm1 = _cm2 = _cm3 = _cm4 = _sbox = None  # array.array('I')
 
 def load_aes_tables(base_dir):
-    global colum_mix1, colum_mix2, colum_mix3, colum_mix4, aes_sbox
-    colum_mix1 = bytearray(open(os.path.join(base_dir, 'aes_colum_mix1'), 'rb').read())
-    colum_mix2 = bytearray(open(os.path.join(base_dir, 'aes_colum_mix2'), 'rb').read())
-    colum_mix3 = bytearray(open(os.path.join(base_dir, 'aes_colum_mix3'), 'rb').read())
-    colum_mix4 = bytearray(open(os.path.join(base_dir, 'aes_colum_mix4'), 'rb').read())
-    aes_sbox   = bytearray(open(os.path.join(base_dir, 'aes_sbox'), 'rb').read())
-
-def tbl32(tbl, idx):
-    return struct.unpack_from('<I', tbl, idx * 4)[0]
+    global _cm1, _cm2, _cm3, _cm4, _sbox
+    def _load(name):
+        raw = open(os.path.join(base_dir, name), 'rb').read()
+        return array.array('I', raw)  # native u32 array, direct index
+    _cm1 = _load('aes_colum_mix1')
+    _cm2 = _load('aes_colum_mix2')
+    _cm3 = _load('aes_colum_mix3')
+    _cm4 = _load('aes_colum_mix4')
+    _sbox = _load('aes_sbox')
 
 def aes_round(data, data_off, key_off, rounds):
-    state = [0]*4
-    for i in range(4):
-        state[i] = bswap32(u32(data, data_off + i*4)) ^ u32(data, key_off + i*4)
+    # Read 16-byte block as 4 big-endian u32, XOR with round key 0
+    cm1, cm2, cm3, cm4, sb = _cm1, _cm2, _cm3, _cm4, _sbox
+    s0 = bswap32(_u32.unpack_from(data, data_off)[0])      ^ _u32.unpack_from(data, key_off)[0]
+    s1 = bswap32(_u32.unpack_from(data, data_off + 4)[0])  ^ _u32.unpack_from(data, key_off + 4)[0]
+    s2 = bswap32(_u32.unpack_from(data, data_off + 8)[0])  ^ _u32.unpack_from(data, key_off + 8)[0]
+    s3 = bswap32(_u32.unpack_from(data, data_off + 12)[0]) ^ _u32.unpack_from(data, key_off + 12)[0]
     for r in range(1, rounds):
         ki = key_off + r * 16
-        t0 = tbl32(colum_mix2, (state[3]>>16)&0xFF) ^ tbl32(colum_mix3, (state[2]>>8)&0xFF) ^ tbl32(colum_mix1, (state[0]>>24)&0xFF) ^ tbl32(colum_mix4, state[1]&0xFF) ^ u32(data, ki)
-        t1 = tbl32(colum_mix2, (state[0]>>16)&0xFF) ^ tbl32(colum_mix1, (state[1]>>24)&0xFF) ^ tbl32(colum_mix3, (state[3]>>8)&0xFF) ^ tbl32(colum_mix4, state[2]&0xFF) ^ u32(data, ki+4)
-        t2 = tbl32(colum_mix2, (state[1]>>16)&0xFF) ^ tbl32(colum_mix3, (state[0]>>8)&0xFF) ^ tbl32(colum_mix1, (state[2]>>24)&0xFF) ^ tbl32(colum_mix4, state[3]&0xFF) ^ u32(data, ki+8)
-        t3 = tbl32(colum_mix3, (state[1]>>8)&0xFF) ^ tbl32(colum_mix2, (state[2]>>16)&0xFF) ^ tbl32(colum_mix1, (state[3]>>24)&0xFF) ^ tbl32(colum_mix4, state[0]&0xFF) ^ u32(data, ki+12)
-        state = [t0, t1, t2, t3]
+        k0 = _u32.unpack_from(data, ki)[0]
+        k1 = _u32.unpack_from(data, ki + 4)[0]
+        k2 = _u32.unpack_from(data, ki + 8)[0]
+        k3 = _u32.unpack_from(data, ki + 12)[0]
+        t0 = cm2[(s3>>16)&0xFF] ^ cm3[(s2>>8)&0xFF] ^ cm1[(s0>>24)&0xFF] ^ cm4[s1&0xFF] ^ k0
+        t1 = cm2[(s0>>16)&0xFF] ^ cm1[(s1>>24)&0xFF] ^ cm3[(s3>>8)&0xFF] ^ cm4[s2&0xFF] ^ k1
+        t2 = cm2[(s1>>16)&0xFF] ^ cm3[(s0>>8)&0xFF] ^ cm1[(s2>>24)&0xFF] ^ cm4[s3&0xFF] ^ k2
+        t3 = cm3[(s1>>8)&0xFF] ^ cm2[(s2>>16)&0xFF] ^ cm1[(s3>>24)&0xFF] ^ cm4[s0&0xFF] ^ k3
+        s0, s1, s2, s3 = t0, t1, t2, t3
+    # Final round (sbox only)
     fki = key_off + rounds * 16
-    fs = [0]*4
-    fs[0] = ((tbl32(aes_sbox,(state[0]>>24)&0xFF)&0xFF000000)|(tbl32(aes_sbox,(state[3]>>16)&0xFF)&0x00FF0000)|(tbl32(aes_sbox,(state[2]>>8)&0xFF)&0x0000FF00)|(tbl32(aes_sbox,state[1]&0xFF)&0x000000FF)) ^ u32(data,fki)
-    fs[1] = ((tbl32(aes_sbox,(state[1]>>24)&0xFF)&0xFF000000)|(tbl32(aes_sbox,(state[0]>>16)&0xFF)&0x00FF0000)|(tbl32(aes_sbox,(state[3]>>8)&0xFF)&0x0000FF00)|(tbl32(aes_sbox,state[2]&0xFF)&0x000000FF)) ^ u32(data,fki+4)
-    fs[2] = ((tbl32(aes_sbox,(state[2]>>24)&0xFF)&0xFF000000)|(tbl32(aes_sbox,(state[1]>>16)&0xFF)&0x00FF0000)|(tbl32(aes_sbox,(state[0]>>8)&0xFF)&0x0000FF00)|(tbl32(aes_sbox,state[3]&0xFF)&0x000000FF)) ^ u32(data,fki+8)
-    fs[3] = ((tbl32(aes_sbox,(state[3]>>24)&0xFF)&0xFF000000)|(tbl32(aes_sbox,(state[2]>>16)&0xFF)&0x00FF0000)|(tbl32(aes_sbox,(state[1]>>8)&0xFF)&0x0000FF00)|(tbl32(aes_sbox,state[0]&0xFF)&0x000000FF)) ^ u32(data,fki+12)
-    for i in range(4):
-        w32(data, data_off + i*4, bswap32(fs[i]))
+    fk0 = _u32.unpack_from(data, fki)[0]
+    fk1 = _u32.unpack_from(data, fki + 4)[0]
+    fk2 = _u32.unpack_from(data, fki + 8)[0]
+    fk3 = _u32.unpack_from(data, fki + 12)[0]
+    f0 = ((sb[(s0>>24)&0xFF]&0xFF000000)|(sb[(s3>>16)&0xFF]&0x00FF0000)|(sb[(s2>>8)&0xFF]&0x0000FF00)|(sb[s1&0xFF]&0x000000FF)) ^ fk0
+    f1 = ((sb[(s1>>24)&0xFF]&0xFF000000)|(sb[(s0>>16)&0xFF]&0x00FF0000)|(sb[(s3>>8)&0xFF]&0x0000FF00)|(sb[s2&0xFF]&0x000000FF)) ^ fk1
+    f2 = ((sb[(s2>>24)&0xFF]&0xFF000000)|(sb[(s1>>16)&0xFF]&0x00FF0000)|(sb[(s0>>8)&0xFF]&0x0000FF00)|(sb[s3&0xFF]&0x000000FF)) ^ fk2
+    f3 = ((sb[(s3>>24)&0xFF]&0xFF000000)|(sb[(s2>>16)&0xFF]&0x00FF0000)|(sb[(s1>>8)&0xFF]&0x0000FF00)|(sb[s0&0xFF]&0x000000FF)) ^ fk3
+    _u32.pack_into(data, data_off,      bswap32(f0))
+    _u32.pack_into(data, data_off + 4,  bswap32(f1))
+    _u32.pack_into(data, data_off + 8,  bswap32(f2))
+    _u32.pack_into(data, data_off + 12, bswap32(f3))
 
 def aes_decrypt(data, data_off, size, key_off):
-    tmp2 = bytearray(16)
+    prev = bytearray(16)
     rounds = u16(data, key_off + 2)
-    for i in range(size >> 4):
+    koff = key_off + 4
+    nblocks = size >> 4
+    for i in range(nblocks):
         idx = data_off + i * 16
-        tmp = bytearray(data[idx:idx+16])
-        aes_round(data, idx, key_off + 4, rounds)
-        for j in range(16):
-            data[idx+j] ^= tmp2[j]
-        tmp2 = tmp
+        cipher = bytearray(data[idx:idx+16])
+        aes_round(data, idx, koff, rounds)
+        # CBC XOR (16 bytes at a time via int)
+        p = int.from_bytes(data[idx:idx+16], 'little') ^ int.from_bytes(prev, 'little')
+        data[idx:idx+16] = p.to_bytes(16, 'little')
+        prev = cipher
 
 # ---------- LZ Decompression ----------
 def decompress(data, data_off, dest, key_off, s_size, d_size, verbose=False):
@@ -305,7 +350,7 @@ def decompress(data, data_off, dest, key_off, s_size, d_size, verbose=False):
     else:
         return True
 
-# ---------- Custom Decryptor Generator ----------
+# ---------- Custom Decryptor Generator (256-byte LUT) ----------
 def generate_custom_decryptor(data, data_off):
     ops = []
     pos = data_off
@@ -335,17 +380,22 @@ def generate_custom_decryptor(data, data_off):
         if opcode not in OPMAP:
             print(f'Unknown opcode 0x{opcode:02X}')
             return None
-    def decryptor(b):
+    # Build 256-byte LUT
+    lut = bytearray(256)
+    for b in range(256):
+        v = b
         for op in ops:
-            if   op[0] == 'add': b = (b + op[1]) & 0xFF
-            elif op[0] == 'sub': b = (b - op[1]) & 0xFF
-            elif op[0] == 'xor': b = b ^ op[1]
-            elif op[0] == 'rol': b = rol8(b, op[1])
-            elif op[0] == 'ror': b = ror8(b, op[1])
-            elif op[0] == 'inc': b = (b + 1) & 0xFF
-            elif op[0] == 'dec': b = (b - 1) & 0xFF
-        return b
-    return decryptor
+            if   op[0] == 'add': v = (v + op[1]) & 0xFF
+            elif op[0] == 'sub': v = (v - op[1]) & 0xFF
+            elif op[0] == 'xor': v = v ^ op[1]
+            elif op[0] == 'rol': v = _ROL8[op[1] & 7][v]
+            elif op[0] == 'ror': v = _ROR8[op[1] & 7][v]
+            elif op[0] == 'inc': v = (v + 1) & 0xFF
+            elif op[0] == 'dec': v = (v - 1) & 0xFF
+        lut[b] = v
+    # Return translate table for bytes.translate() and also a direct LUT
+    _translate_tbl = bytes.maketrans(bytes(range(256)), bytes(lut))
+    return lut, _translate_tbl
 
 # ---------- DecryptAndDecompress ----------
 def decrypt_and_decompress(data, data_off, key, key_offsets, custom_dec=None, verbose=False):
@@ -358,8 +408,9 @@ def decrypt_and_decompress(data, data_off, key, key_offsets, custom_dec=None, ve
     aes_decrypt(data, src, s_sz, key_offsets[3])
     decrypt_data3(data, data_off, key, 19)
     if custom_dec is not None:
-        for i in range(s_sz):
-            data[src + i] = custom_dec(data[src + i])
+        _lut, _tt = custom_dec
+        # Bulk translate using bytes.translate (C-speed)
+        data[src:src + s_sz] = bytearray(bytes(data[src:src + s_sz]).translate(_tt))
     if s_sz != d_sz:
         return decompress(data, src, dst, key_offsets[1], s_sz, d_sz, verbose=verbose)
     return True
@@ -1051,8 +1102,8 @@ def main():
             file_src = src2 + compress_data_offset
             data[dst2:dst2 + s_sz2] = clean_file_data[file_src:file_src + s_sz2]
             aes_decrypt(data, dst2, s_sz2, key_offsets[2])
-            for i3 in range(s_sz2):
-                data[dst2 + i3] = file_dec(data[dst2 + i3])
+            _lut, _tt = file_dec
+            data[dst2:dst2 + s_sz2] = bytearray(bytes(data[dst2:dst2 + s_sz2]).translate(_tt))
             if s_sz2 != d_sz2:
                 decompress(data, dst2, dst2, key_offsets[0], s_sz2, d_sz2)
             block_count += 1
@@ -1087,8 +1138,7 @@ def main():
             if s_sz3 == 0:
                 break
             zero_ranges.append((src3, s_sz3))
-            for i4 in range(s_sz3):
-                data[src3 + i4] = 0
+            data[src3:src3 + s_sz3] = b'\x00' * s_sz3
             zero_count += 1
         print(f'  Zeroed {zero_count} regions')
         for zr, zs in zero_ranges[:5]:
@@ -1404,7 +1454,7 @@ def main():
         print(f'\n=== Writing {out_file} ===')
         with open(out_file, 'wb') as f:
             f.write(data)
-        print('Done!')
+        print(f'Done! {_elapsed()}')
         return
 
     # ============================================================
@@ -1641,8 +1691,7 @@ def main():
         zero_ptr += 16
         if s_sz3 == 0: break
         if src3 + s_sz3 > len(data): break
-        for i4 in range(s_sz3):
-            data[src3 + i4] = 0
+        data[src3:src3 + s_sz3] = b'\x00' * s_sz3
 
     # File data decompression
     clean_file_data = bytearray(open(in_file, 'rb').read())
@@ -1660,8 +1709,8 @@ def main():
         file_src = src2 + compress_data_offset
         data[dst2:dst2 + s_sz2] = clean_file_data[file_src:file_src + s_sz2]
         aes_decrypt(data, dst2, s_sz2, key_offsets[2])
-        for i3 in range(s_sz2):
-            data[dst2 + i3] = file_dec(data[dst2 + i3])
+        _lut, _tt = file_dec
+        data[dst2:dst2 + s_sz2] = bytearray(bytes(data[dst2:dst2 + s_sz2]).translate(_tt))
         if s_sz2 != d_sz2:
             decompress(data, dst2, dst2, key_offsets[0], s_sz2, d_sz2)
 
@@ -1776,7 +1825,7 @@ def main():
     print(f'\n=== Writing {out_file} ===')
     with open(out_file, 'wb') as f:
         f.write(data)
-    print('Done!')
+    print(f'Done! {_elapsed()}')
 
 
 if __name__ == '__main__':
