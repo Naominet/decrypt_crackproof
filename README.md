@@ -753,15 +753,15 @@ EighthStage 内部偏移因样本而异，使用自动检测而非固定偏移�
 **位置**: decrypt_crackproof.py:2102
 
 旧逻辑 min(lfsr_candidates, key=lambda c: abs(c - off_file_lfsr)) 选离 expected 绝对距离最小的候选。chusanApp_HJ_1.20 出现 5 个候选 [0x407C, 0x4093, 0x40DC, 0x4111, 0x4201]，expected=0x40FC：
-- 正确的是  x40DC（delta -32，与其他 chusanApp_2.20+ 样本一致）
-- 旧逻辑选了  x4111（delta +21，是 false candidate）
+- 正确的是 0x40DC（delta -32，与其他 chusanApp_2.20+ 样本一致）
+- 旧逻辑选了 0x4111（delta +21，是 false candidate）
 
 **改为分层优先**：精确匹配 > 最近的负 delta > 最近的正 delta。
 
 ### 修复 4: PE32+ path fileLFSR 候选选择
 **位置**: PE32+ path file LFSR loop
 
-旧逻辑 or lfsr_off in reversed(all_lfsrs) 选最后一个有 in-image pointer 的候选。SDGT170GameProject 有 3 个 in-image 候选，最后一个 +0x5060 的 fileCS=0x2A8F624 落在 image 中段；真正的 +0x5000 fileCS=0x45908D0 在 info[3]=0x454B000 之后（符合所有 OK 样本的模式）。
+旧逻辑 for lfsr_off in reversed(all_lfsrs) 选最后一个有 in-image pointer 的候选。SDGT170GameProject 有 3 个 in-image 候选，最后一个 +0x5060 的 fileCS=0x2A8F624 落在 image 中段；真正的 +0x5000 fileCS=0x45908D0 在 info[3]=0x454B000 之后（符合所有 OK 样本的模式）。
 
 **改为按 fileCS 距 info[3] 的最小正距离选择**：fileCS 必须 ≥ info[3]（fileCS 表在元数据区域之后），选 dist 最小的。fallback 仍是旧 reversed 逻辑（保持已通过样本不回归）。
 
@@ -929,7 +929,7 @@ DIE 现在能正确识别这些样本为 .NET assembly（不再只显示操作�
 
 新启发式：**对 decrypt_data8 mutate 的 255 个位置（每 16 字节块的 `ri & 0xF` 偏移），统计有多少在变换后 == 0xCC**。
 
-`python
+```python
 for bi in range(1, 256):
     rk = ((k >> 15) | (k << 17)) & 0xFFFFFFFF
     ri = (rk + bi) & 0xFFFFFFFF
@@ -938,8 +938,7 @@ for bi in range(1, 256):
     mutated = src[tidx] ^ (k & 0xFF)
     if mutated == 0xCC:
         hits += 1
-`
-
+```
 baseline `none` 用 `tidx = bi * 16` 等距采样原页面，count 已是 0xCC 的位置。
 
 判定规则：仅当 `best >= 2x baseline` 才应用 decrypt_data8，否则视为已是明文。
@@ -968,7 +967,7 @@ EP 解出：`48 83 EC 28 E8 43 09 00 00 48 83 C4 28 E9 7A FE` (sub rsp, 0x28; ca
 
 针对用户报告 sgxmaster.exe 脱完仍 0xC0000005「应用程序无法正常启动」，用 cdb 调试器精确定位崩溃点：
 
-`ntdll!LdrpAllocateTlsEntry+0xc8: mov dword ptr [rcx],edx  ds:00000000 0000000=????????`
+`ntdll!LdrpAllocateTlsEntry+0xc8: mov dword ptr [rcx],edx  ds:0000000000000000=????????`
 
 ### 根因
 
@@ -980,7 +979,7 @@ CrackProof metadata 把 TLS 数据目录字段填入了一个 RVA (0x85900, size
 
 跟 COR20 一样的处理逻辑 —— 检测 TLS dir 指向的结构体若全为 0，就清零 TLS 目录字段：
 
-`python
+```python
 tls_dir_off = exe_pe + 0xD0
 tls_rva = u32(data, tls_dir_off)
 if tls_rva and tls_rva + 24 <= len(data):
@@ -990,8 +989,7 @@ if tls_rva and tls_rva + 24 <= len(data):
     if raw_start == 0 and raw_end == 0 and cb_addr == 0:
         w32(data, tls_dir_off, 0)
         w32(data, tls_dir_off + 4, 0)
-`
-
+```
 清零后 PE loader 跳过静态 TLS 处理，进程能正常启动。
 
 ### 验证（cdb 抓崩溃前后对比）
