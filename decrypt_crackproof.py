@@ -1548,12 +1548,48 @@ def main():
         if import_rva_final == 0 and saved_import_rva:
             import_rva_final, import_size_final = saved_import_rva, saved_import_size
 
+        def _valid_reloc_dir(rva, size):
+            if not (rva and size and rva + size <= len(data)):
+                return False
+            pos = rva
+            end = rva + size
+            blocks = 0
+            entries = 0
+            while pos + 8 <= end:
+                page = u32(data, pos)
+                block_size = u32(data, pos + 4)
+                if page == 0 and block_size == 0:
+                    break
+                if block_size < 8 or block_size % 4 != 0 or pos + block_size > end:
+                    return False
+                count = (block_size - 8) // 2
+                if count == 0 or page >= image_size or page & 0xFFF:
+                    return False
+                for entry_idx in range(count):
+                    reloc_type = u16(data, pos + 8 + entry_idx * 2) >> 12
+                    if reloc_type not in (0, 3, 10):
+                        return False
+                blocks += 1
+                entries += count
+                pos += block_size
+            return blocks > 0 and entries > 0
+
+        reloc_rva = u32(dirs, 5 * 8)
+        reloc_size = u32(dirs, 5 * 8 + 4)
+        has_valid_reloc = _valid_reloc_dir(reloc_rva, reloc_size)
+
         # Set entry point (0 is legal: TLS-only / SEGA system component).
         w32(data, exe_pe + 40, original_ep)
         # Write the chosen Import RVA into the PE header.
         w32(data, exe_pe + 0x90, import_rva_final)
         w32(data, exe_pe + 0x94, import_size_final)
+        if has_valid_reloc:
+            w32(data, exe_pe + 0xB0, reloc_rva)
+            w32(data, exe_pe + 0xB4, reloc_size)
+            w16(data, exe_pe + 94, u16(file_data, pe_header + 94))
         print(f'  Layout {layout}: EP=0x{original_ep:X}, Import RVA=0x{import_rva_final:X}/{import_size_final:X}')
+        if has_valid_reloc:
+            print(f'  BaseReloc restored: RVA=0x{reloc_rva:X} Size=0x{reloc_size:X}')
 
         # ---- .NET MetaData restore (CrackProof leaves it unencrypted) ----
         # For .NET assemblies, CrackProof preserves the COR20 header + BSJB
@@ -1625,8 +1661,13 @@ def main():
             print(f'  Restored export table at 0x{export_va:X}')
 
         # ---- .text decrypt_data8 (EXE only) -----------------------------
-        # Skip when EP == 0 (TLS-only) or when EP doesn't fall inside .text.
-        if text_size > 0 and text_off > 0 and text_off <= original_ep < text_off + text_size:
+        # DLL samples already contain final .text after file decompression;
+        # running decrypt_data8 on their DllMain corrupts code and makes the
+        # loader fail with ERROR_DLL_INIT_FAILED.
+        is_dll = (u16(data, exe_pe + 22) & 0x2000) != 0
+        if is_dll:
+            print('  decrypt_data8: DLL image, skipping')
+        if (not is_dll) and text_size > 0 and text_off > 0 and text_off <= original_ep < text_off + text_size:
             def _apply_d8_page(buf, t_off, page_idx, key_formula):
                 pk = key_formula(page_idx)
                 pa = t_off + page_idx * 0x1000
@@ -1865,16 +1906,14 @@ def main():
 
         print(f'  Total: {dll_count} DLLs, Import RVA=0x{import_rva_final:X} Size=0x{import_size_final:X}')
 
-        # Subsystem - keep the value supplied by the protected file's PE header
-        # (CrackProof preserves it). DllCharacteristics zeroed because the
-        # protected stub uses none. BaseReloc dir is cleared: CrackProof did
-        # not preserve a valid base-relocation table - the metadata's value
-        # tends to point into .fptable, and .reloc itself holds CrackProof
-        # data not reloc blocks. Most CrackProof'd binaries are /FIXED so the
-        # loader doesn't need relocations.
-        w16(data, exe_pe + 94, 0)
-        w32(data, exe_pe + 0xB0, 0)
-        w32(data, exe_pe + 0xB4, 0)
+        # Subsystem is kept from the protected PE header. Relocations are
+        # kept only when metadata points at a valid relocation block table;
+        # otherwise clear them because some CrackProof metadata points into
+        # shell bookkeeping rather than real IMAGE_BASE_RELOCATION data.
+        if not has_valid_reloc:
+            w16(data, exe_pe + 94, 0)
+            w32(data, exe_pe + 0xB0, 0)
+            w32(data, exe_pe + 0xB4, 0)
 
         # ---- Write output ----
         dot = in_file.rfind('.')
