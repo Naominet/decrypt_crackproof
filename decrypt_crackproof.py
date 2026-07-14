@@ -478,16 +478,66 @@ def decrypt_data7(data, data_offset, key):
 # ---------- AES (optimized: array.array for direct indexing) ----------
 _cm1 = _cm2 = _cm3 = _cm4 = _sbox = None  # array.array('I')
 
-def load_aes_tables(base_dir):
+_AES_TABLE_FILES = ('aes_colum_mix1', 'aes_colum_mix2', 'aes_colum_mix3',
+                    'aes_colum_mix4', 'aes_sbox')
+
+
+def gen_aes_tables():
+    """Generate the AES decryption tables (Td0-3 + inverse S-box, each replicated
+    0x01010101) entirely in code, byte-identical to the aes_* data files. This
+    lets the tool run with no external table files (the tables are standard AES
+    constants, not sample-specific data)."""
     global _cm1, _cm2, _cm3, _cm4, _sbox
-    def _load(name):
-        raw = open(os.path.join(base_dir, name), 'rb').read()
-        return array.array('I', raw)  # native u32 array, direct index
-    _cm1 = _load('aes_colum_mix1')
-    _cm2 = _load('aes_colum_mix2')
-    _cm3 = _load('aes_colum_mix3')
-    _cm4 = _load('aes_colum_mix4')
-    _sbox = _load('aes_sbox')
+    def _xt(a):
+        a <<= 1
+        return (a ^ 0x11B) & 0xFF if a & 0x100 else a & 0xFF
+    exp = [0] * 256; log = [0] * 256; x = 1
+    for i in range(255):
+        exp[i] = x; log[x] = i; x ^= _xt(x)        # x *= 3 (generator)
+    def _inv(a):
+        return 0 if a == 0 else exp[(255 - log[a]) % 255]
+    sbox = []
+    for i in range(256):
+        b = _inv(i); s = b
+        for _ in range(4):
+            b = ((b << 1) | (b >> 7)) & 0xFF; s ^= b
+        sbox.append((s ^ 0x63) & 0xFF)
+    isb = [0] * 256
+    for i in range(256):
+        isb[sbox[i]] = i
+    def _mul(a, b):
+        r = 0
+        for _ in range(8):
+            if b & 1: r ^= a
+            a = _xt(a); b >>= 1
+        return r & 0xFF
+    def _ror(w, n):
+        return ((w >> n) | (w << (32 - n))) & 0xFFFFFFFF
+    td0 = [((_mul(isb[a], 0x0E) << 24) | (_mul(isb[a], 0x09) << 16)
+            | (_mul(isb[a], 0x0D) << 8) | _mul(isb[a], 0x0B)) & 0xFFFFFFFF
+           for a in range(256)]
+    _cm1 = array.array('I', td0)
+    _cm2 = array.array('I', [_ror(w, 8) for w in td0])
+    _cm3 = array.array('I', [_ror(w, 16) for w in td0])
+    _cm4 = array.array('I', [_ror(w, 24) for w in td0])
+    _sbox = array.array('I', [(0x01010101 * isb[i]) & 0xFFFFFFFF for i in range(256)])
+
+
+def load_aes_tables(base_dir):
+    """Load the AES tables from `base_dir`; if the directory or files are not
+    available, generate them in code (they are standard AES constants)."""
+    global _cm1, _cm2, _cm3, _cm4, _sbox
+    if base_dir and all(os.path.exists(os.path.join(base_dir, n)) for n in _AES_TABLE_FILES):
+        def _load(name):
+            raw = open(os.path.join(base_dir, name), 'rb').read()
+            return array.array('I', raw)  # native u32 array, direct index
+        _cm1 = _load('aes_colum_mix1')
+        _cm2 = _load('aes_colum_mix2')
+        _cm3 = _load('aes_colum_mix3')
+        _cm4 = _load('aes_colum_mix4')
+        _sbox = _load('aes_sbox')
+    else:
+        gen_aes_tables()
 
 def aes_round(data, data_off, key_off, rounds):
     # Read 16-byte block as 4 big-endian u32, XOR with round key 0
@@ -796,6 +846,113 @@ def find_tbl(data, info):
 # Main unpacker
 # ============================================================
 
+# Cross-layout target-header trailer (written by encrypt_crackproof.py for packs
+# whose target program layout differs from the donor stub). It carries the
+# target's real section table + image sizing so we can emit a valid final PE
+# instead of the donor's layout. Absent on identity packs and stock CrackProof
+# samples -> parsing returns None and unpacking is unchanged.
+_TGT_HDR_MAGIC = b'CPXSECT\x00'
+
+
+def _parse_target_hdr_trailer(buf):
+    """Return dict(nsec, simg, shdr, flags, sectbl, hdr) if buf ends with a valid
+    trailer, else None. Layout: payload + crc32(payload)[4] + len(payload)[4] +
+    MAGIC[8]. payload = <IIII nsec,simg,shdr,flags> + sectbl + optional
+    <I hdrlen> + hdrbytes (verbatim target header [0:SizeOfHeaders])."""
+    if len(buf) < 32 or bytes(buf[-8:]) != _TGT_HDR_MAGIC:
+        return None
+    plen = struct.unpack_from('<I', buf, len(buf) - 12)[0]
+    crc = struct.unpack_from('<I', buf, len(buf) - 16)[0]
+    start = len(buf) - 16 - plen
+    if start < 0 or plen < 16:
+        return None
+    payload = bytes(buf[start:len(buf) - 16])
+    if (zlib.crc32(payload) & 0xFFFFFFFF) != crc:
+        return None
+    nsec, simg, shdr, flags = struct.unpack_from('<IIII', payload, 0)
+    sectbl = payload[16:16 + nsec * 40]
+    if len(sectbl) != nsec * 40:
+        return None
+    # Optional verbatim target header tail (new format). Absent in old packs.
+    hdr = None
+    tail = 16 + nsec * 40
+    if len(payload) >= tail + 4:
+        hdr_len = struct.unpack_from('<I', payload, tail)[0]
+        if 0 < hdr_len <= len(payload) - (tail + 4):
+            hdr = payload[tail + 4:tail + 4 + hdr_len]
+    return dict(nsec=nsec, simg=simg, shdr=shdr, flags=flags, sectbl=sectbl, hdr=hdr)
+
+
+def _apply_target_hdr(data, tgt_hdr):
+    """Rewrite NumberOfSections / SizeOfImage / SizeOfHeaders / section table with
+    the carried target values and resize the flat (file==RVA) image to the target
+    SizeOfImage. decrypt's own EP / import / resource restore is left intact."""
+    simg = tgt_hdr['simg']
+    hdr = tgt_hdr.get('hdr')
+    if hdr is not None:
+        # New format: restore the target's verbatim header region (DOS header +
+        # DOS stub + PE header at the *target's own* e_lfanew + optional header +
+        # data directories + section table), overwriting the shell stub's header
+        # so e_lfanew / DOS stub / header fields match the target byte-for-byte.
+        # This is what makes cross-stub-layout repacks (e.g. Sinmai e_lfanew=0x110
+        # packed with an amdaemon-stub e_lfanew=0x128) reproduce the original
+        # header exactly. The decoded program body [SizeOfHeaders:] already
+        # matches the target, so header + body == the original target.
+        data[0:len(hdr)] = hdr
+        pe = struct.unpack_from('<I', data, 0x3C)[0]
+        optsz = struct.unpack_from('<H', data, pe + 0x14)[0]
+        nsec = struct.unpack_from('<H', data, pe + 6)[0]
+        st = pe + 0x18 + optsz
+        # The reconstructed image is a flat file==RVA dump. The target's header is
+        # itself already flat (PtrRaw==VA), so this fixup is normally a no-op, but
+        # re-assert it defensively for any compact-PtrRaw target header.
+        for i in range(nsec):
+            s = st + i * 40
+            va = struct.unpack_from('<I', data, s + 12)[0]
+            vs = struct.unpack_from('<I', data, s + 8)[0]
+            rsz = vs
+            if va + rsz > simg:
+                rsz = simg - va if simg > va else 0
+            w32(data, s + 16, rsz)   # SizeOfRawData = VirtualSize
+            w32(data, s + 20, va)    # PointerToRawData = VirtualAddress
+        if len(data) < simg:
+            data.extend(b'\x00' * (simg - len(data)))
+        elif len(data) > simg:
+            del data[simg:]
+        return
+    # Legacy format (no verbatim header): patch the shell header in place.
+    pe = struct.unpack_from('<I', data, 0x3C)[0]
+    nsec = tgt_hdr['nsec']; shdr = tgt_hdr['shdr']
+    optsz = struct.unpack_from('<H', data, pe + 0x14)[0]
+    donor_nsec = struct.unpack_from('<H', data, pe + 6)[0]
+    w16(data, pe + 6, nsec)
+    w32(data, pe + 0x50, simg)
+    w32(data, pe + 0x54, shdr)
+    st = pe + 0x18 + optsz
+    data[st:st + nsec * 40] = tgt_hdr['sectbl']
+    # The reconstructed image is a flat file==RVA dump, so each section's raw data
+    # lives at its VirtualAddress, NOT at the target's (compact) PointerToRawData.
+    # Rewrite PointerToRawData = VirtualAddress and SizeOfRawData = VirtualSize so the
+    # Windows loader maps the correct bytes. (For targets that were already flat
+    # file==RVA, PtrRaw already equals VA, so this is a no-op.)
+    for i in range(nsec):
+        s = st + i * 40
+        va = struct.unpack_from('<I', data, s + 12)[0]
+        vs = struct.unpack_from('<I', data, s + 8)[0]
+        rsz = vs
+        if va + rsz > simg:
+            rsz = simg - va if simg > va else 0
+        w32(data, s + 16, rsz)   # SizeOfRawData = VirtualSize
+        w32(data, s + 20, va)    # PointerToRawData = VirtualAddress
+    if nsec < donor_nsec:
+        z = st + nsec * 40
+        data[z:z + (donor_nsec - nsec) * 40] = b'\x00' * ((donor_nsec - nsec) * 40)
+    if len(data) < simg:
+        data.extend(b'\x00' * (simg - len(data)))
+    elif len(data) > simg:
+        del data[simg:]
+
+
 def main():
     if len(sys.argv) < 2:
         print('Usage: python decrypt_crackproof.py <input_file> [aes_tables_dir]')
@@ -804,11 +961,18 @@ def main():
     in_file = sys.argv[1]
     aes_dir = sys.argv[2] if len(sys.argv) >= 3 else os.path.join('F:', os.sep, 'SEGA', 'DecryptCrackproofDll64')
 
-    print(f'Loading AES tables from {aes_dir}')
+    if aes_dir and all(os.path.exists(os.path.join(aes_dir, n)) for n in _AES_TABLE_FILES):
+        print(f'Loading AES tables from {aes_dir}')
+    else:
+        print('Generating AES tables in code (no external table files)')
     load_aes_tables(aes_dir)
 
     print(f'Reading {in_file}')
     file_data = bytearray(open(in_file, 'rb').read())
+    _tgt_hdr = _parse_target_hdr_trailer(file_data)
+    if _tgt_hdr is not None:
+        print(f'  [+] cross-layout target-header trailer found: nsec={_tgt_hdr["nsec"]} '
+              f'SizeOfImage=0x{_tgt_hdr["simg"]:X} (will rebuild final section table)')
 
     # ---- Detect PE type ----
     pe_header = u32(file_data, 60)
@@ -1347,7 +1511,15 @@ def main():
                 compress_candidates.append((doff, ptr_val))
 
         if compress_candidates:
-            off_compressed_info = compress_candidates[0][0]
+            # Prefer the candidate whose pointer sits closest to (but >= ) info[3]:
+            # the real compressedInfo table lives just past the metadata at info[3]
+            # (info[3]+~0x280), while decoy pointers sit much higher in the shell.
+            # Picking the lowest in-shell pointer avoids false positives that only
+            # validate when the image is grown (relocated) and len(data) is larger.
+            info3v = info[3]
+            ranked = sorted(compress_candidates,
+                            key=lambda c: (c[1] - info3v) if c[1] >= info3v else (1 << 62))
+            off_compressed_info = ranked[0][0]
             print(f'  compressedInfo at eighth+0x{off_compressed_info:X}, ptr -> 0x{u32(data, eighth_start + off_compressed_info):08X}')
         else:
             print('ERROR: could not locate compressedInfo in eighthStage')
@@ -1388,34 +1560,97 @@ def main():
         clean_file_data = bytearray(open(in_file, 'rb').read())
         # compress_data_offset already computed above
 
-        # Save metadata before decompression for corruption detection
-        meta_before = bytes(data[info[3]:info[3] + 0x100])
+        # Save metadata before decompression for corruption detection. Save enough
+        # to cover both Layout-A (info3+0x40,+144) and Layout-B (info3+0x10,+0x290)
+        # metadata so OVERLAP packs (whose program tail decompresses over [info3:])
+        # can still recover the shell's EP/data-dirs from this pre-decompression copy.
+        meta_before = bytes(data[info[3]:info[3] + 0x300])
 
         compressed_info_addr = eighth_start + off_compressed_info
         compressed_info = u32(data, compressed_info_addr)
         print(f'  compressDataOffset = 0x{compress_data_offset:X}')
         print(f'  compressedDataInfo = 0x{compressed_info:08X}')
 
-        block_count = 0
-        decomp_ranges = []
+        # OVERLAP packs decompress the program tail over [info3:image], which clobbers
+        # BOTH the file-decryptor tables (AES schedule key_offsets[2], LZ huffman
+        # key_offsets[0]) AND the compressedInfo/zero-list table itself (at info3+0x280).
+        # The runtime reads the whole table and loads the key tables once; mirror that:
+        #   (1) read ALL records (compressedInfo + zero-list) BEFORE decompressing,
+        #   (2) grow the buffer to cover every record destination + target image (a
+        #       large OVERLAP target's image exceeds the packed-file-derived buffer),
+        #   (3) cache the key tables in a scratch region placed ABOVE the image so
+        #       the decompression writes can never clobber it.
+
+        # Phase 1: read all records while the table is still intact.
+        recs = []
         while True:
             decrypt_data5(data, compressed_info, 16)
-            src2  = u32(data, compressed_info)
-            s_sz2 = u32(data, compressed_info + 4)
-            dst2  = u32(data, compressed_info + 8)
-            d_sz2 = u32(data, compressed_info + 12)
+            s2 = u32(data, compressed_info); ssz2 = u32(data, compressed_info + 4)
+            d2 = u32(data, compressed_info + 8); dsz2 = u32(data, compressed_info + 12)
             compressed_info += 16
-            if s_sz2 == 0:
+            if ssz2 == 0:
                 break
+            recs.append((s2, ssz2, d2, dsz2))
+        zero_recs = []
+        while True:
+            decrypt_data5(data, compressed_info, 16)
+            s3 = u32(data, compressed_info); ssz3 = u32(data, compressed_info + 4)
+            compressed_info += 16
+            if ssz3 == 0:
+                break
+            zero_recs.append((s3, ssz3))
+
+        # Grow the buffer so every record destination (and the carried target
+        # SizeOfImage) is in-bounds. Large OVERLAP repacks whose image exceeds the
+        # packed-file-derived buffer would otherwise overflow at dst2 inside
+        # aes_decrypt (struct.error: buffer too small) and clobber the scratch key
+        # cache, which must live ABOVE the reconstructed image.
+        need = len(data)
+        for _s2, _ssz2, _d2, _dsz2 in recs:
+            need = max(need, _d2 + _ssz2, _d2 + _dsz2)
+        if _tgt_hdr is not None:
+            need = max(need, _tgt_hdr['simg'])
+        if len(data) < need:
+            data.extend(b'\x00' * (need - len(data)))
+
+        # Scratch ABOVE the image: cache the key tables the decompression clobbers.
+        _scratch = len(data)
+        data.extend(b'\x00' * 0x4000)
+        ko2_s = _scratch
+        data[ko2_s:ko2_s + 0x1000] = data[key_offsets[2]:key_offsets[2] + 0x1000]
+        ko0_s = _scratch + 0x2000
+        data[ko0_s:ko0_s + 0x1000] = data[key_offsets[0]:key_offsets[0] + 0x1000]
+
+        # The OVERLAP tail [info3:image] of the target is zero-initialised BSS:
+        # the packer stores only non-zero pages, so no compressedInfo record
+        # covers it. The packed file, however, still holds the shell's
+        # table/metadata/payload bytes throughout that range. Clear [info3:image]
+        # (the key tables that live at ~info3+0x280 are already cached above) so
+        # the uncovered tail reconstructs as the target's zeros instead of leaked
+        # shell bytes. Records that DO land here (rare non-zero tail data) are
+        # re-applied by Phase 2 below. Only targets whose image exceeds info3 have
+        # this tail; image<=info3 packs leave _scratch==info3-ish so this is a
+        # no-op and the 84 small/medium samples are unaffected.
+        if info[3] < _scratch:
+            data[info[3]:_scratch] = b'\x00' * (_scratch - info[3])
+
+        # Phase 2: decompress (may overwrite the table region; records already read).
+        block_count = 0
+        decomp_ranges = []
+        for src2, s_sz2, dst2, d_sz2 in recs:
             decomp_ranges.append((dst2, d_sz2))
             file_src = src2 + compress_data_offset
-            data[dst2:dst2 + s_sz2] = clean_file_data[file_src:file_src + s_sz2]
-            aes_decrypt(data, dst2, s_sz2, key_offsets[2])
+            chunk = clean_file_data[file_src:file_src + s_sz2]
+            if len(chunk) < s_sz2:               # source truncated -> zero-fill tail
+                chunk = chunk + b'\x00' * (s_sz2 - len(chunk))
+            data[dst2:dst2 + s_sz2] = chunk
+            aes_decrypt(data, dst2, s_sz2, ko2_s)
             _lut, _tt = file_dec
             data[dst2:dst2 + s_sz2] = bytearray(bytes(data[dst2:dst2 + s_sz2]).translate(_tt))
             if s_sz2 != d_sz2:
-                decompress(data, dst2, dst2, key_offsets[0], s_sz2, d_sz2)
+                decompress(data, dst2, dst2, ko0_s, s_sz2, d_sz2)
             block_count += 1
+        del data[_scratch:]   # drop scratch
         print(f'  Decrypted {block_count} data blocks')
         # Print decompression coverage
         decomp_ranges.sort()
@@ -1430,8 +1665,8 @@ def main():
 
         # Check if file decompression corrupted metadata area
         meta_after = bytes(data[info[3]:info[3] + 0x100])
-        if meta_before != meta_after:
-            changed = sum(1 for a,b in zip(meta_before, meta_after) if a != b)
+        if meta_before[:0x100] != meta_after:
+            changed = sum(1 for a,b in zip(meta_before[:0x100], meta_after) if a != b)
             print(f'  WARNING: metadata at info[3]=0x{info[3]:X} changed by decompression ({changed} bytes differ)')
         else:
             print(f'  Metadata at info[3]=0x{info[3]:X} NOT affected by decompression')
@@ -1439,13 +1674,7 @@ def main():
         # ---- Zero-out list (C# DLL: runs AFTER file decompression) ----
         zero_count = 0
         zero_ranges = []
-        while True:
-            decrypt_data5(data, compressed_info, 16)
-            src3  = u32(data, compressed_info)
-            s_sz3 = u32(data, compressed_info + 4)
-            compressed_info += 16
-            if s_sz3 == 0:
-                break
+        for src3, s_sz3 in zero_recs:
             zero_ranges.append((src3, s_sz3))
             data[src3:src3 + s_sz3] = b'\x00' * s_sz3
             zero_count += 1
@@ -1465,6 +1694,12 @@ def main():
         # validating that the candidate points at a plausible IDT entry.
         print('\n=== Metadata + Import reconstruction ===')
 
+        # OVERLAP packs reconstruct the program tail over [info3:tgt], clobbering the
+        # shell metadata at info3+0x10/0x40. Restore the pre-decompression metadata
+        # (meta_before) just for the EP/data-dir read, then put the program tail back.
+        live_meta = bytes(data[info[3]:info[3] + 0x300])
+        data[info[3]:info[3] + 0x300] = meta_before
+
         backup = bytes(data[info[3] + 0x10:info[3] + 0x10 + 0x290])
         decrypt_data5(data, info[3] + 0x10, 0x290)
         ep_B   = u32(data, info[3] + 0x20)
@@ -1476,6 +1711,8 @@ def main():
         ep_A   = u32(data, info[3] + 0x40)
         dirs_A = bytes(data[info[3] + 0x50:info[3] + 0x50 + 128])
         data[info[3] + 0x40:info[3] + 0x40 + 144] = backupA
+
+        data[info[3]:info[3] + 0x300] = live_meta   # restore program tail (overlap)
 
         # Restore the protected file's PE header into the live image so that
         # section bookkeeping operates on a known-good copy.
@@ -1592,7 +1829,11 @@ def main():
                     return rp + (rva - va)
             return None
 
-        if clr_rva and clr_size and clr_rva + clr_size <= len(data):
+        # A cross-layout REPACK (trailer present) embeds the FINAL plaintext program,
+        # so the COR20/BSJB metadata is already reconstructed by the file-decode loop;
+        # copying it again from the (re-)packed file reads the wrong bytes. Only do the
+        # verbatim restore for ORIGINAL CrackProof samples.
+        if _tgt_hdr is None and clr_rva and clr_size and clr_rva + clr_size <= len(data):
             cor_off = _prot_rva_to_off(clr_rva)
             if cor_off is not None and cor_off + 0x48 <= len(file_data):
                 # Verify it's a real COR20 header (cb field == 0x48).
@@ -1641,9 +1882,12 @@ def main():
         # running decrypt_data8 on their DllMain corrupts code and makes the
         # loader fail with ERROR_DLL_INIT_FAILED.
         is_dll = (u16(data, exe_pe + 22) & 0x2000) != 0
+        _skip_d8 = _tgt_hdr is not None and (_tgt_hdr.get('flags', 0) & 1)
         if is_dll:
             print('  decrypt_data8: DLL image, skipping')
-        if (not is_dll) and text_size > 0 and text_off > 0 and text_off <= original_ep < text_off + text_size:
+        if _skip_d8:
+            print('  decrypt_data8: skipped (cross-layout repack carries final plaintext .text)')
+        if (not _skip_d8) and (not is_dll) and text_size > 0 and text_off > 0 and text_off <= original_ep < text_off + text_size:
             def _apply_d8_page(buf, t_off, page_idx, key_formula):
                 pk = key_formula(page_idx)
                 pa = t_off + page_idx * 0x1000
@@ -1734,6 +1978,15 @@ def main():
                 print(f'  decrypt_data8: skipped (.text already decoded, 0xCC score={best_score})')
 
         # ---- decrypt_data7 on DLL/function names + IAT range -----------
+        # The packer obfuscates import-name strings (genuine CrackProof format),
+        # so this de-obfuscation is required for BOTH original samples and
+        # cross-layout repacks (SEGA: every DLL, .NET: kernel32). The IDT is
+        # terminated by a null entry (name_rva == 0), NOT by the directory size
+        # field, which many linkers under-declare. The .NET runaway walk that
+        # used to scribble decrypt_data7 over the header was caused by the
+        # COR20/BSJB restore clobbering the IDT's null terminator; that restore
+        # is now gated off for repacks (see above), so the IDT stays
+        # null-terminated and the standard name_rva == 0 stop is sufficient.
         dll_count = 0
         iat_min, iat_max = 0xFFFFFFFF, 0
         if import_rva_final:
@@ -1892,6 +2145,11 @@ def main():
             w32(data, exe_pe + 0xB4, 0)
 
         # ---- Write output ----
+        if _tgt_hdr is not None:
+            _apply_target_hdr(data, _tgt_hdr)
+            print(f'  [+] rebuilt final PE header from cross-layout trailer '
+                  f'(nsec={_tgt_hdr["nsec"]}, SizeOfImage=0x{_tgt_hdr["simg"]:X}, '
+                  f'output 0x{len(data):X} bytes)')
         dot = in_file.rfind('.')
         out_file = in_file[:dot] + '.unpack' + in_file[dot:] if dot >= 0 else in_file + '.unpack'
         print(f'\n=== Writing {out_file} ===')
@@ -2391,39 +2649,100 @@ def main():
     if tls_dir_rva > 0 and tls_dir_sz >= 24 and tls_dir_rva + 24 <= len(data):
         tls_vals = struct.unpack_from('<6I', data, tls_dir_rva)
         if all(v == 0 for v in tls_vals):
-            # TLS data is all zeros — try to reconstruct
+            # TLS directory contents are cleared in the CrackProof final image.
             image_base = u32(data, exe_pe + 52)
-            # Find .tls and .data sections
-            tls_sec_va = 0; data_sec_va = 0; data_sec_sz = 0
-            _sh = exe_pe + 24 + u16(data, exe_pe + 20)
-            _ns = u16(data, exe_pe + 6)
-            for _i in range(_ns):
-                _s = _sh + _i * 40
-                _nm = data[_s:_s+8]
-                _va = u32(data, _s + 12)
-                _sz = u32(data, _s + 16)
-                if _nm[:4] == b'.tls':
-                    tls_sec_va = _va
-                if _nm[:5] == b'.data':
-                    data_sec_va = _va; data_sec_sz = _sz
-            if tls_sec_va > 0 and data_sec_va > 0:
-                # Reconstruct TLS directory
-                start_raw = image_base + tls_sec_va
-                end_raw = start_raw  # Empty TLS data (safe default)
-                # Use last 16 bytes of .data as scratch for TLS index and callbacks
-                # (these bytes are typically zero in BSS area)
-                idx_addr = image_base + data_sec_va + data_sec_sz - 16
-                cb_addr  = image_base + data_sec_va + data_sec_sz - 8
-                # Make sure the scratch area is zeroed
-                data[data_sec_va + data_sec_sz - 16 : data_sec_va + data_sec_sz] = b'\x00' * 16
-                struct.pack_into('<6I', data, tls_dir_rva,
-                    start_raw, end_raw, idx_addr, cb_addr, 0, 0x300000)
-                print(f'  TLS reconstructed: Start=0x{start_raw:X} End=0x{end_raw:X} Index=0x{idx_addr:X} Cb=0x{cb_addr:X}')
+
+            # Preferred path: recover the ORIGINAL 24-byte TLS directory and its
+            # declared template from the protected source PE. CrackProof leaves a
+            # valid TLS dir RVA but zeroes its contents; synthesizing a fresh dir
+            # (fallback below) redirects AddressOfIndex to scratch space, yet the
+            # program's own code still selects TLS slots through its original index
+            # variable (referenced from hundreds of functions). The Windows loader
+            # then initialises a different variable than the one runtime code reads,
+            # and the thread-state mismatch causes timing-dependent heap corruption
+            # (STATUS_HEAP_CORRUPTION, 0xC0000374). Restoring the original loader
+            # state from the source PE keeps index/callbacks/template intact.
+            def _prot_rva_to_off_pe32(rva):
+                """Map an RVA to a file offset via the protected PE's section table."""
+                _pns = u16(file_data, pe_header + 6)
+                _popt = u16(file_data, pe_header + 20)
+                _ptab = pe_header + 24 + _popt
+                for _pi in range(_pns):
+                    _ps = _ptab + _pi * 40
+                    _pva = u32(file_data, _ps + 12)
+                    _pvs = u32(file_data, _ps + 8)
+                    _prsz = u32(file_data, _ps + 16)
+                    _prp = u32(file_data, _ps + 20)
+                    if _pva <= rva < _pva + max(_pvs, _prsz):
+                        return _prp + (rva - _pva)
+                return None
+
+            def _restore_original_tls():
+                dir_off = _prot_rva_to_off_pe32(tls_dir_rva)
+                if dir_off is None or dir_off + 24 > len(file_data):
+                    return False
+                directory = bytes(file_data[dir_off:dir_off + 24])
+                start = struct.unpack_from('<I', directory, 0)[0]
+                end   = struct.unpack_from('<I', directory, 4)[0]
+                # StartAddressOfRawData/EndAddressOfRawData are VAs; derive the
+                # template's RVA + size and require a sane ordering.
+                if start < image_base or end < start:
+                    return False
+                template_rva  = start - image_base
+                template_size = end - start
+                template_off  = _prot_rva_to_off_pe32(template_rva)
+                if template_off is None or template_off + template_size > len(file_data):
+                    return False
+                if template_rva + template_size > len(data):
+                    return False
+                # Restore the directory verbatim, then copy the declared template
+                # (may be empty; the directory alone carries index/callback VAs).
+                data[tls_dir_rva:tls_dir_rva + 24] = directory
+                if template_size:
+                    data[template_rva:template_rva + template_size] = \
+                        file_data[template_off:template_off + template_size]
+                return True
+
+            if _restore_original_tls():
+                print(f'  TLS restored from source PE: '
+                      f'Start=0x{u32(data, tls_dir_rva):X} '
+                      f'End=0x{u32(data, tls_dir_rva + 4):X} '
+                      f'Index=0x{u32(data, tls_dir_rva + 8):X} '
+                      f'Callbacks=0x{u32(data, tls_dir_rva + 12):X}')
             else:
-                # Can't reconstruct — clear TLS directory to prevent crash
-                w32(data, exe_pe + 0xC0, 0)
-                w32(data, exe_pe + 0xC4, 0)
-                print(f'  TLS cleared (no .tls/.data section found)')
+                # Fallback: synthesize a minimal empty-TLS loader state when the
+                # original state cannot be mapped safely from the source PE.
+                # Find .tls and .data sections
+                tls_sec_va = 0; data_sec_va = 0; data_sec_sz = 0
+                _sh = exe_pe + 24 + u16(data, exe_pe + 20)
+                _ns = u16(data, exe_pe + 6)
+                for _i in range(_ns):
+                    _s = _sh + _i * 40
+                    _nm = data[_s:_s+8]
+                    _va = u32(data, _s + 12)
+                    _sz = u32(data, _s + 16)
+                    if _nm[:4] == b'.tls':
+                        tls_sec_va = _va
+                    if _nm[:5] == b'.data':
+                        data_sec_va = _va; data_sec_sz = _sz
+                if tls_sec_va > 0 and data_sec_va > 0:
+                    # Reconstruct TLS directory
+                    start_raw = image_base + tls_sec_va
+                    end_raw = start_raw  # Empty TLS data (safe default)
+                    # Use last 16 bytes of .data as scratch for TLS index and callbacks
+                    # (these bytes are typically zero in BSS area)
+                    idx_addr = image_base + data_sec_va + data_sec_sz - 16
+                    cb_addr  = image_base + data_sec_va + data_sec_sz - 8
+                    # Make sure the scratch area is zeroed
+                    data[data_sec_va + data_sec_sz - 16 : data_sec_va + data_sec_sz] = b'\x00' * 16
+                    struct.pack_into('<6I', data, tls_dir_rva,
+                        start_raw, end_raw, idx_addr, cb_addr, 0, 0x300000)
+                    print(f'  TLS synthesized (source recover failed): Start=0x{start_raw:X} End=0x{end_raw:X} Index=0x{idx_addr:X} Cb=0x{cb_addr:X}')
+                else:
+                    # Can't reconstruct — clear TLS directory to prevent crash
+                    w32(data, exe_pe + 0xC0, 0)
+                    w32(data, exe_pe + 0xC4, 0)
+                    print(f'  TLS cleared (no .tls/.data section found)')
 
     # Import table (PE32, 4-byte thunks)
     import_table_addr = eighth_start + off_import_table
