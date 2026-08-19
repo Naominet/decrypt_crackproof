@@ -1848,6 +1848,16 @@ def main():
                             if file_data[md_off:md_off + 4] == b'BSJB':
                                 data[md_rva:md_rva + md_size] = file_data[md_off:md_off + md_size]
                                 print(f'  .NET BSJB MetaData restored @ RVA=0x{md_rva:X} size=0x{md_size:X}')
+                    resources_rva = u32(data, clr_rva + 0x18)
+                    resources_size = u32(data, clr_rva + 0x1C)
+                    if resources_rva and resources_size and resources_rva + resources_size <= len(data):
+                        resources_off = _prot_rva_to_off(resources_rva)
+                        if resources_off is not None and resources_off + resources_size <= len(file_data):
+                            current_resources = data[resources_rva:resources_rva + resources_size]
+                            protected_resources = file_data[resources_off:resources_off + resources_size]
+                            if not any(current_resources) and any(protected_resources):
+                                data[resources_rva:resources_rva + resources_size] = protected_resources
+                                print(f'  .NET Resources restored @ RVA=0x{resources_rva:X} size=0x{resources_size:X}')
 
         # ---- Section table fixup ----
         export_va   = u32(clean_file_data, pe_header + 24 + opt_hdr_size - 128)
