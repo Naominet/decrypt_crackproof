@@ -959,7 +959,9 @@ def main():
         return
 
     in_file = sys.argv[1]
-    aes_dir = sys.argv[2] if len(sys.argv) >= 3 else os.path.join('F:', os.sep, 'SEGA', 'DecryptCrackproofDll64')
+    # AES tables are standard constants, so generate them once at startup by
+    # default. Passing a directory keeps compatibility with the legacy files.
+    aes_dir = sys.argv[2] if len(sys.argv) >= 3 else None
 
     if aes_dir and all(os.path.exists(os.path.join(aes_dir, n)) for n in _AES_TABLE_FILES):
         print(f'Loading AES tables from {aes_dir}')
