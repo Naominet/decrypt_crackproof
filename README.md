@@ -33,6 +33,7 @@
 |---|---|
 | decrypt.py | PE32/PE32+ 脱壳、数据解密、解压和 PE 结构修复 |
 | README.md | 使用和实现说明 |
+| LICENSE | GNU Affero General Public License v3.0 完整文本 |
 
 旧版需要单独分发的五个 AES 表文件已经移除。程序默认在内存中生成等价表。
 
@@ -390,3 +391,13 @@ AES 使用壳中保存的解密密钥调度。普通轮使用四张 T-table，�
 - 导入表重建可能改变导入节的排列，但不应改变实际导入语义。
 - 无效 TLS、Reloc 或 CLR 目录可能被安全清零；这属于加载器兼容性修复，而不是原样保留。
 - 对新布局增加支持时，应优先增加结构验证和候选评分，不应继续堆叠未经验证的文件专属绝对偏移。
+
+---
+
+## 开源协议
+
+本项目以 **GNU Affero General Public License version 3**（`AGPL-3.0-only`）发布。完整协议文本见 `LICENSE`。
+
+如果修改后的程序通过网络向用户提供交互功能，AGPLv3 第 13 条要求向这些用户提供正在运行版本的对应源代码。
+
+Copyright (C) 2026 Nyadecrypt contributors.

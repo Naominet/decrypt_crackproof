@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Nyadecrypt contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
 import struct
 import os
 import sys
