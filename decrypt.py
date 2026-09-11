@@ -236,6 +236,9 @@ def move_pe32_imports_to_kmiat(data, pe_header, *, section_size=0x7000):
         name_pos += len(desc['dll_name'].encode('ascii', errors='replace')) + 1
         for func in desc['functions']:
             if func[0] == 'name':
+                # IMAGE_IMPORT_BY_NAME begins with a WORD Hint and must be
+                # aligned to a 2-byte boundary for the Windows loader.
+                name_pos = align_up(name_pos, 2)
                 name_pos += 2 + len(func[2].encode('ascii', errors='replace')) + 1
 
     if name_pos > kmiat_rva + section_size:
@@ -263,6 +266,7 @@ def move_pe32_imports_to_kmiat(data, pe_header, *, section_size=0x7000):
             if func[0] == 'ordinal':
                 w32(data, oft_pos, 0x80000000 | func[1])
             else:
+                name_pos = align_up(name_pos, 2)
                 hint_name_rva = name_pos
                 w32(data, oft_pos, hint_name_rva)
                 w16(data, hint_name_rva, func[1])
@@ -388,6 +392,7 @@ def decrypt_data3(data, data_offset, key, shift):
         val = (val - i) & M
         _u32.pack_into(data, addr, val)
 
+
 # Pre-build decrypt_data4 transform: ror5(b) ^ key2 -> ror5 -> ^ key1 -> ror5
 # Since keys cycle 0-255, pre-build 256 full-byte LUTs for decrypt_data4 and decrypt_data5
 _d4_lut = None  # [key1][key2][byte] -> result
@@ -446,6 +451,22 @@ def decrypt_data5(data, va, size):
         data[va + i] = tbl[data[va + i]]
         key1 = (key1 + 1) & 0xFF
         key2 = (key2 + 1) & 0xFF
+
+def trial_decrypt5_u32(data, va):
+    """Decrypt one little-endian u32 with decrypt_data5 without mutating data."""
+    if va < 0 or va + 4 > len(data):
+        raise IndexError('trial_decrypt5_u32 out of range')
+    key1 = va & 0xFF
+    key2 = (key1 + 1) & 0xFF
+    out = bytearray(4)
+    for i in range(4):
+        b = _ROL8[2][data[va + i]] ^ key2
+        b = _ROL8[2][b] ^ key1
+        out[i] = _ROL8[2][b]
+        key1 = (key1 + 1) & 0xFF
+        key2 = (key2 + 1) & 0xFF
+    return int.from_bytes(out, 'little')
+
 
 def decrypt_data6(data, data_offset):
     sz = data[data_offset + 95]
@@ -955,7 +976,7 @@ def _apply_target_hdr(data, tgt_hdr):
 
 def main():
     if len(sys.argv) < 2:
-        print('Usage: python decrypt_crackproof.py <input_file> [aes_tables_dir]')
+        print('Usage: python decrypt.py <input_file> [aes_tables_dir]')
         return
 
     in_file = sys.argv[1]
@@ -2204,16 +2225,49 @@ def main():
     second_stage_key = u32(data, tbl + 0x40)
     print(f'  headerChecksum = 0x{header_checksum:08X}')
 
-    # SecondStage
+    # SecondStage. Native PE32 DLLs can carry a packer-added BaseReloc
+    # directory entry that was absent when headerChecksum was calculated. Try
+    # the restored header first, then zero BaseReloc and recalculate; validate
+    # the result through the decrypted ThirdStage (offset,size) pair.
     print('\n=== Stage 3: SecondStage ===')
     ss_pair = tbl + 0x98
-    ss_key = (header_checksum ^ first_stage_cs ^ second_stage_key) & 0xFFFFFFFF
-    decrypt_data3(data, ss_pair, ss_key, 21)
     ss = u32(data, ss_pair)
     ss_size = u32(data, ss_pair + 4)
+    if not (0x1000 <= ss < len(data) and 4 <= ss_size <= len(data) - ss):
+        print(f'ERROR: invalid SecondStage range 0x{ss:X}+0x{ss_size:X}')
+        return
+    ss_shift = ss_size - 0xBC0
+    third_pair_off = 0xB8C + ss_shift
+    encrypted_ss = bytes(data[ss:ss + ss_size])
+    second_stage_ok = False
+    for zero_reloc in (False, True):
+        if zero_reloc:
+            # PE32 data-directory base is pe+0x78; BaseReloc is entry 5.
+            w32(data, pe_header + 0xA0, 0)
+            w32(data, pe_header + 0xA4, 0)
+        hcs_addr = tbl + 0x58
+        header_checksum = 0
+        while u32(data, hcs_addr + 4) != 0:
+            header_checksum ^= checksum_with_size_xor(data, hcs_addr)
+            hcs_addr += 8
+        ss_key = (header_checksum ^ first_stage_cs ^ second_stage_key) & 0xFFFFFFFF
+        data[ss:ss + ss_size] = encrypted_ss
+        decrypt_data3(data, ss_pair, ss_key, 21)
+        pair_addr = ss + third_pair_off
+        ts_test = u32(data, pair_addr)
+        ts_size_test = u32(data, pair_addr + 4)
+        if (0x1000 < ts_test < len(data)
+                and 4 <= ts_size_test <= len(data) - ts_test):
+            second_stage_ok = True
+            if zero_reloc:
+                print(f'  PE32 DLL BaseReloc cleared; headerChecksum '
+                      f'recalculated to 0x{header_checksum:08X}')
+            break
+    if not second_stage_ok:
+        print('ERROR: SecondStage validation failed')
+        return
     print(f'  secondStageStart = 0x{ss:08X}, size = 0x{ss_size:X}')
 
-    ss_shift = ss_size - 0xBC0
     if ss_shift not in (0, 0x10):
         print(f'WARNING: unexpected ss_size 0x{ss_size:X}')
 
@@ -2225,7 +2279,6 @@ def main():
 
     # ThirdStage
     print('\n=== Stage 4: ThirdStage ===')
-    third_pair_off = 0xB8C + ss_shift
     ts, ts_size = None, None
 
     # try_decrypt_third_stage (PE32, in-place)
@@ -2403,11 +2456,34 @@ def main():
     print(f'  eighthStageStart = 0x{eighth_start:08X}, dsz = 0x{eighth_dsz:X}')
 
     # ---- Final processing (PE32) ----
-    off_import_table = 0x3C50 + ss_shift
-    off_file_cs      = 0x3C68 + ss_shift
-    off_compressed_info = 0x3C78 + ss_shift
-    off_zero_list    = 0x3C80 + ss_shift
-    off_file_lfsr    = 0x40EC + ss_shift
+    # Anchor the final-stage fields on the 0x7679 marker. Standard EXEs place
+    # it where the historical fixed offsets point; native DLLs use a smaller
+    # eighthStage and move this cluster earlier.
+    marker_off = None
+    marker_scan_hi = max(0, eighth_dsz - 0x4C)
+    for off in range(0, marker_scan_hi, 4):
+        marker_addr = eighth_start + off
+        if marker_addr + 0x34 > len(data):
+            break
+        if u32(data, marker_addr) == 0x7679:
+            file_cs_test = u32(data, marker_addr + 0x30)
+            if info[3] < file_cs_test < len(data):
+                marker_off = off
+                break
+    if marker_off is not None:
+        off_import_table = marker_off + 0x18
+        off_file_cs = marker_off + 0x30
+        off_compressed_info = marker_off + 0x40
+        off_zero_list = marker_off + 0x48
+        off_file_lfsr = marker_off + 0x4B4
+        print(f'  final-stage marker at eighth+0x{marker_off:X}')
+    else:
+        off_import_table = 0x3C50 + ss_shift
+        off_file_cs = 0x3C68 + ss_shift
+        off_compressed_info = 0x3C78 + ss_shift
+        off_zero_list = 0x3C80 + ss_shift
+        off_file_lfsr = 0x40EC + ss_shift
+        print('  final-stage marker not found; using legacy fixed offsets')
     print(f'\n=== Final: File data decryption (PE32) ===')
 
     # File checksums
@@ -2424,55 +2500,132 @@ def main():
             decrypt_data5(data, file_cs_addr, 16)
             file_cs_addr += 16
 
-    # File decryptor — validate LFSR at expected offset, fallback to scan
+    # File decryptor. Native DLLs have a smaller eighthStage, so the marker-
+    # relative expected LFSR offset can lie beyond it. In that case, enumerate
+    # strict candidates and accept only one that can decrypt/decompress the
+    # first compressed block.
+    def file_lfsr_validates(file_dec_addr, compressed_info_slot):
+        if file_dec_addr < 0 or file_dec_addr + 96 > len(data):
+            return False
+        lfsr_snapshot = bytes(data[file_dec_addr:file_dec_addr + 96])
+        try:
+            decrypt_data6(data, file_dec_addr)
+            candidate_dec = generate_custom_decryptor(data, file_dec_addr)
+        except (IndexError, struct.error):
+            candidate_dec = None
+        finally:
+            data[file_dec_addr:file_dec_addr + 96] = lfsr_snapshot
+        if candidate_dec is None:
+            return False
+
+        try:
+            if compressed_info_slot < 0 or compressed_info_slot + 4 > len(data):
+                return False
+            table = u32(data, compressed_info_slot)
+            if table == 0 or table + 16 > len(data):
+                return False
+            compress_data_offset = ((~u32(file_data, 0x1080)) & 0xFFFFFFFF) + 0x1000
+            entry = table
+            for _ in range(256):
+                if entry + 16 > len(data):
+                    return False
+                src2 = trial_decrypt5_u32(data, entry)
+                s_sz2 = trial_decrypt5_u32(data, entry + 4)
+                dst2 = trial_decrypt5_u32(data, entry + 8)
+                d_sz2 = trial_decrypt5_u32(data, entry + 12)
+                if s_sz2 == 0:
+                    return False
+                if s_sz2 != d_sz2:
+                    file_src = src2 + compress_data_offset
+                    if (dst2 < 0x1000 or s_sz2 > d_sz2
+                            or file_src + s_sz2 > len(file_data)
+                            or dst2 + d_sz2 > len(data)):
+                        return False
+                    dst_snapshot = bytes(data[dst2:dst2 + d_sz2])
+                    try:
+                        data[dst2:dst2 + s_sz2] = file_data[file_src:file_src + s_sz2]
+                        aes_decrypt(data, dst2, s_sz2, key_offsets[2])
+                        _candidate_lut, candidate_tt = candidate_dec
+                        data[dst2:dst2 + s_sz2] = bytearray(
+                            bytes(data[dst2:dst2 + s_sz2]).translate(candidate_tt))
+                        return decompress(data, dst2, dst2, key_offsets[0],
+                                          s_sz2, d_sz2)
+                    finally:
+                        data[dst2:dst2 + d_sz2] = dst_snapshot
+                entry += 16
+        except (IndexError, struct.error):
+            return False
+        return False
+
     lfsr_off = off_file_lfsr
-    # Check exact offset first
-    lfsr_found = find_lfsr_block(data, eighth_start, eighth_dsz, lfsr_off)
-    if lfsr_found == lfsr_off:
-        pass  # exact offset is valid
-    else:
-        # Scan all candidates from off_zero_list, pick closest to off_file_lfsr
-        valid_opcodes = {0x04, 0x2C, 0x34, 0x90, 0xC0, 0xC3, 0xFE}
-        lfsr_candidates = []
-        for scan_off in range(off_zero_list, eighth_dsz - 95):
-            abs_off = eighth_start + scan_off
-            sz = data[abs_off + 95]
-            if sz < 10 or sz > 95:
-                continue
-            lfsr = 1
-            decoded = bytearray(sz)
-            src = data[abs_off:abs_off + sz]
-            for bi in range(sz):
-                b = src[bi]
-                for bit in range(8):
-                    b ^= ((lfsr & 1) << bit)
-                    lfsr <<= 1
-                    if lfsr & 0x8000: lfsr ^= 0x8003
-                    lfsr &= 0xFFFF
-                decoded[bi] = b
-            if decoded[0] in valid_opcodes and 0xC3 in decoded:
-                lfsr_candidates.append(scan_off)
-        if lfsr_candidates:
-            # The real file LFSR lives at or just *before* off_file_lfsr in every
-            # observed sample (delta in {0, -0x20}). False positives (other LFSR
-            # blocks used elsewhere) sit after it with a smaller |delta|, which
-            # the legacy "closest absolute" rule misses. Prefer exact, then the
-            # smallest negative delta, fall back to the smallest positive.
-            exact = [c for c in lfsr_candidates if c == off_file_lfsr]
-            negatives = sorted([c for c in lfsr_candidates if c < off_file_lfsr],
-                               key=lambda c: off_file_lfsr - c)
-            positives = sorted([c for c in lfsr_candidates if c > off_file_lfsr],
-                               key=lambda c: c - off_file_lfsr)
-            if exact:
-                lfsr_off = exact[0]
-            elif negatives:
-                lfsr_off = negatives[0]
+    if off_file_lfsr + 96 <= eighth_dsz:
+        lfsr_found = find_lfsr_block(data, eighth_start, eighth_dsz,
+                                     off_file_lfsr)
+        if lfsr_found != off_file_lfsr:
+            valid_opcodes = {0x04, 0x2C, 0x34, 0x90, 0xC0, 0xC3, 0xFE}
+            lfsr_candidates = []
+            scan_stop = max(off_zero_list, eighth_dsz - 95)
+            for scan_off in range(off_zero_list, scan_stop):
+                abs_off = eighth_start + scan_off
+                if abs_off + 96 > len(data):
+                    break
+                sz = data[abs_off + 95]
+                if sz < 10 or sz > 95:
+                    continue
+                lfsr = 1
+                decoded = bytearray(sz)
+                src = data[abs_off:abs_off + sz]
+                for bi in range(sz):
+                    b = src[bi]
+                    for bit in range(8):
+                        b ^= ((lfsr & 1) << bit)
+                        lfsr <<= 1
+                        if lfsr & 0x8000:
+                            lfsr ^= 0x8003
+                        lfsr &= 0xFFFF
+                    decoded[bi] = b
+                if decoded[0] in valid_opcodes and 0xC3 in decoded:
+                    lfsr_candidates.append(scan_off)
+            if lfsr_candidates:
+                exact = [c for c in lfsr_candidates if c == off_file_lfsr]
+                negatives = sorted(
+                    [c for c in lfsr_candidates if c < off_file_lfsr],
+                    key=lambda c: off_file_lfsr - c)
+                positives = sorted(
+                    [c for c in lfsr_candidates if c > off_file_lfsr],
+                    key=lambda c: c - off_file_lfsr)
+                if exact:
+                    lfsr_off = exact[0]
+                elif negatives:
+                    lfsr_off = negatives[0]
+                else:
+                    lfsr_off = positives[0]
+                print(f'  fileLFSR adjusted: eighth+0x{lfsr_off:X} '
+                      f'(expected 0x{off_file_lfsr:X}, '
+                      f'{len(lfsr_candidates)} candidates)')
             else:
-                lfsr_off = positives[0]
-            print(f'  fileLFSR adjusted: eighth+0x{lfsr_off:X} (expected 0x{off_file_lfsr:X}, {len(lfsr_candidates)} candidates)')
-        else:
-            print('ERROR: could not locate file LFSR in eighthStage')
+                print('ERROR: could not locate file LFSR in eighthStage')
+                return
+    else:
+        compressed_info_slot = eighth_start + off_compressed_info
+        scan_off = off_zero_list + 8
+        lfsr_off = None
+        while True:
+            candidate = find_lfsr_block(data, eighth_start, eighth_dsz,
+                                        scan_off)
+            if candidate is None:
+                break
+            if file_lfsr_validates(eighth_start + candidate,
+                                   compressed_info_slot):
+                lfsr_off = candidate
+                break
+            scan_off = candidate + 1
+        if lfsr_off is None:
+            print('ERROR: could not validate file LFSR in native DLL eighthStage')
             return
+        print(f'  native DLL fileLFSR selected by decompression validation: '
+              f'eighth+0x{lfsr_off:X}')
+
     print(f'  fileLFSR at eighth+0x{lfsr_off:X}')
     file_dec_addr = eighth_start + lfsr_off
     decrypt_data6(data, file_dec_addr)
@@ -2601,6 +2754,13 @@ def main():
             ('page+1', lambda p: p + 1),
             ('0x8000*(page+1)', lambda p: 0x8000 * (p + 1)),
         ]
+        # Native DLL .text may already be plaintext. Compare both transforms
+        # against the untouched 0xCC-padding baseline and only apply data8 when
+        # it actually improves the code-padding score (matching the C++ path).
+        baseline_cc = sum(
+            data[text_off + sp * 0x1000:text_off + (sp + 1) * 0x1000].count(0xCC)
+            for sp in sample_pages
+        )
         best_score = -1
         best_name = 'none'
         best_func = None
@@ -2625,8 +2785,14 @@ def main():
                 best_score = total_cc
                 best_name = fname
                 best_func = ffunc
-        if sample_pages:
-            print(f'  decrypt_data8 auto-detect: {best_name} (0xCC score={best_score} on {len(sample_pages)} sample pages)')
+        if not sample_pages or best_score <= baseline_cc:
+            print(f'  decrypt_data8 skipped: .text already plaintext '
+                  f'(best={best_name} score={best_score}, baseline={baseline_cc})')
+            best_func = None
+        else:
+            print(f'  decrypt_data8 auto-detect: {best_name} '
+                  f'(0xCC score={best_score}, baseline={baseline_cc}, '
+                  f'{len(sample_pages)} sample pages)')
 
         if best_func is not None:
             print(f'\n=== Decrypting .text with decrypt_data8 ({best_name}) ===')
@@ -2849,7 +3015,14 @@ def main():
         out_file = in_file + '.unpack'
     print(f'\n=== Writing {out_file} ===')
     if is_pe32:
-        if not pe32_imports_already_match_idata_layout(data, pe_header):
+        is_native_dll = bool(u16(data, pe_header + 22) & 0x2000)
+        if is_native_dll:
+            # Native DLLs already carry a loader-valid decrypted IDT in the
+            # restored image. Relocating it to the former shell section can
+            # make LdrpSnapModule imports crash before TLS/DllMain (observed
+            # as 0xC0000005 in ntdll), so retain the original IDT/IAT layout.
+            print('  Native PE32 DLL: retaining original import table layout')
+        elif not pe32_imports_already_match_idata_layout(data, pe_header):
             data = move_pe32_imports_to_kmiat(data, pe_header)
         data = compact_memory_image_to_pe(data, pe_header)
     with open(out_file, 'wb') as f:
