@@ -1637,12 +1637,19 @@ def main():
             data.extend(b'\x00' * (need - len(data)))
 
         # Scratch ABOVE the image: cache the key tables the decompression clobbers.
+        # The Huffman table can exceed 0x1000 bytes (one observed layout uses
+        # 0x1108), so reserve 0x2000 bytes for each table. Copy only bytes that
+        # exist below the original image end; the pre-zeroed remainder stays 0.
         _scratch = len(data)
         data.extend(b'\x00' * 0x4000)
         ko2_s = _scratch
-        data[ko2_s:ko2_s + 0x1000] = data[key_offsets[2]:key_offsets[2] + 0x1000]
         ko0_s = _scratch + 0x2000
-        data[ko0_s:ko0_s + 0x1000] = data[key_offsets[0]:key_offsets[0] + 0x1000]
+        _ko2_len = min(0x2000, max(0, _scratch - key_offsets[2]))
+        _ko0_len = min(0x2000, max(0, _scratch - key_offsets[0]))
+        data[ko2_s:ko2_s + _ko2_len] = \
+            data[key_offsets[2]:key_offsets[2] + _ko2_len]
+        data[ko0_s:ko0_s + _ko0_len] = \
+            data[key_offsets[0]:key_offsets[0] + _ko0_len]
 
         # The OVERLAP tail [info3:image] of the target is zero-initialised BSS:
         # the packer stores only non-zero pages, so no compressedInfo record
