@@ -977,24 +977,54 @@ def _apply_target_hdr(data, tgt_hdr):
         del data[simg:]
 
 
-def main():
-    if len(sys.argv) < 2:
-        print('Usage: python decrypt.py <input_file> [aes_tables_dir]')
-        return
+_SUPPORTED_PE_EXTENSIONS = {'.exe', '.dll'}
 
-    in_file = sys.argv[1]
-    # AES tables are standard constants, so generate them once at startup by
-    # default. Passing a directory keeps compatibility with the legacy files.
-    aes_dir = sys.argv[2] if len(sys.argv) >= 3 else None
 
-    if aes_dir and all(os.path.exists(os.path.join(aes_dir, n)) for n in _AES_TABLE_FILES):
-        print(f'Loading AES tables from {aes_dir}')
-    else:
-        print('Generating AES tables in code (no external table files)')
-    load_aes_tables(aes_dir)
+def _has_supported_pe_extension(path):
+    return os.path.splitext(os.fspath(path))[1].lower() in _SUPPORTED_PE_EXTENSIONS
 
+
+def _inspect_crackproof_pe(file_data):
+    """Return (state, detail) where state is packed, plain, or invalid."""
+    if len(file_data) < 0x40:
+        return 'invalid', 'file is too small for a PE header'
+    if file_data[:2] != b'MZ':
+        return 'invalid', 'missing MZ header'
+
+    try:
+        pe_header = u32(file_data, 0x3C)
+        if pe_header < 0x40 or pe_header + 26 > len(file_data):
+            return 'invalid', 'invalid PE header offset'
+        if file_data[pe_header:pe_header + 4] != b'PE\x00\x00':
+            return 'invalid', 'missing PE signature'
+        pe_magic = u16(file_data, pe_header + 24)
+        if pe_magic not in (0x10B, 0x20B):
+            return 'invalid', f'unsupported optional-header magic 0x{pe_magic:X}'
+        if len(file_data) < 0x1020:
+            return 'plain', 'file has no CrackProof info block'
+        info = decrypt_data1(file_data)
+    except (IndexError, struct.error, ValueError) as exc:
+        return 'invalid', str(exc)
+
+    if info[1] != 0x4E4E4F4B:
+        return 'plain', 'CrackProof KONN marker not found'
+    return 'packed', 'CrackProof KONN marker found'
+
+
+def _iter_folder_candidates(folder):
+    """Collect EXE/DLL files recursively before any output files are created."""
+    candidates = []
+    for root, dirs, files in os.walk(folder):
+        dirs.sort(key=str.lower)
+        for name in sorted(files, key=str.lower):
+            path = os.path.join(root, name)
+            if _has_supported_pe_extension(path):
+                candidates.append(path)
+    return candidates
+
+
+def _decrypt_file(in_file, file_data):
     print(f'Reading {in_file}')
-    file_data = bytearray(open(in_file, 'rb').read())
     _tgt_hdr = _parse_target_hdr_trailer(file_data)
     if _tgt_hdr is not None:
         print(f'  [+] cross-layout target-header trailer found: nsec={_tgt_hdr["nsec"]} '
@@ -1013,7 +1043,7 @@ def main():
         print(f'  info[{i}] = 0x{info[i]:08X}')
     if info[1] != 0x4E4E4F4B:
         print('ERROR: bad magic (not KONN)')
-        return
+        return False
 
     # ---- Stage 2: Decrypt shell region ----
     print('\n=== Stage 2: DecryptData2 (shell) ===')
@@ -1049,7 +1079,7 @@ def main():
                     break
         if anchor is None:
             print('ERROR: cannot locate anchor in shell')
-            return
+            return False
         print(f'  anchor = 0x{anchor:X} (shell+0x{anchor-shell:X})')
         print(f'  fcs = 0x{fcs:X} (anchor+0x{fcs-anchor:X})')
 
@@ -1171,7 +1201,7 @@ def main():
                         break
         if info_table is None:
             print('ERROR: cannot locate infoTable')
-            return
+            return False
 
         # ---- Process infoTable ----
         print('\n=== Processing infoTable ===')
@@ -1315,7 +1345,7 @@ def main():
 
         if not seven_success:
             print('ERROR: could not decrypt sevenStage with any key offset')
-            return
+            return False
 
         # ---- Stage 8: EighthStage ----
         print('\n=== Stage 8: EighthStage ===')
@@ -1330,14 +1360,14 @@ def main():
             custom_dec_off = find_lfsr_block(data, seven_start_actual, seven_dsz, 0)
         if custom_dec_off is None:
             print('ERROR: could not locate customDecryptor in sevenStage')
-            return
+            return False
         custom_dec_addr = seven_start_actual + custom_dec_off
         print(f'  customDecryptor at seven+0x{custom_dec_off:X}')
         decrypt_data6(data, custom_dec_addr)
         custom_dec = generate_custom_decryptor(data, custom_dec_addr)
         if custom_dec is None:
             print('ERROR: failed to generate custom decryptor')
-            return
+            return False
         print(f'  customDecryptor generated OK')
 
         # C# ref line 704: sevenStageChecksum at ss + 0xD90
@@ -1393,7 +1423,7 @@ def main():
 
         if not eighth_key_success:
             print('ERROR: could not find valid eighthStageKey')
-            return
+            return False
 
         eighth_start = u32(data, eighth_addr_pair)
         print(f'  eighthStageStart = 0x{eighth_start:08X}')
@@ -1466,7 +1496,7 @@ def main():
             print(f'  fileLFSR at eighth+0x{off_file_lfsr:X} (fileCS at +0x{cs_off:X} -> 0x{cs_val:08X})')
         if off_file_lfsr is None:
             print('ERROR: could not locate file LFSR in eighthStage')
-            return
+            return False
 
         # Derive fileCS (C# ref: fileDecryptorAddress = fileChecksumAddresses + 0x58)
         off_file_cs = off_file_lfsr - 0x58
@@ -1476,7 +1506,7 @@ def main():
 
         if file_cs_addr == 0 or file_cs_addr >= len(data) - 8:
             print('ERROR: fileCS pointer is invalid')
-            return
+            return False
 
         # Search for compressedInfo and importTable
         # Strategy: find the anchor, collect all valid pointer values in the data area,
@@ -1549,7 +1579,7 @@ def main():
             print(f'  compressedInfo at eighth+0x{off_compressed_info:X}, ptr -> 0x{u32(data, eighth_start + off_compressed_info):08X}')
         else:
             print('ERROR: could not locate compressedInfo in eighthStage')
-            return
+            return False
 
         # importTable: search all pointer values for one pointing to zeros/empty IDT area
         # (the IDT is populated AFTER file decompression, so currently it may be zeros)
@@ -1580,7 +1610,7 @@ def main():
         file_dec = generate_custom_decryptor(data, file_dec_addr)
         if file_dec is None:
             print('ERROR: failed to generate file decryptor')
-            return
+            return False
 
         # ---- Decompress file data blocks ----
         clean_file_data = bytearray(open(in_file, 'rb').read())
@@ -2199,7 +2229,7 @@ def main():
         with open(out_file, 'wb') as f:
             f.write(data)
         print(f'Done! {_elapsed()}')
-        return
+        return True
 
     # ============================================================
     # PE32 (32-bit) processing
@@ -2208,7 +2238,7 @@ def main():
     tbl = find_tbl(data, info)
     if tbl is None:
         print('ERROR: cannot locate tbl in shell')
-        return
+        return False
     print(f'  tbl = 0x{tbl:X}')
 
     # PE header restore
@@ -2245,7 +2275,7 @@ def main():
     ss_size = u32(data, ss_pair + 4)
     if not (0x1000 <= ss < len(data) and 4 <= ss_size <= len(data) - ss):
         print(f'ERROR: invalid SecondStage range 0x{ss:X}+0x{ss_size:X}')
-        return
+        return False
     ss_shift = ss_size - 0xBC0
     third_pair_off = 0xB8C + ss_shift
     encrypted_ss = bytes(data[ss:ss + ss_size])
@@ -2275,7 +2305,7 @@ def main():
             break
     if not second_stage_ok:
         print('ERROR: SecondStage validation failed')
-        return
+        return False
     print(f'  secondStageStart = 0x{ss:08X}, size = 0x{ss_size:X}')
 
     if ss_shift not in (0, 0x10):
@@ -2322,7 +2352,7 @@ def main():
             break
     if ts is None:
         print('ERROR: cannot decrypt thirdStage')
-        return
+        return False
 
     # Process infoTable
     it_addr = info_table
@@ -2402,13 +2432,13 @@ def main():
         custom_dec_off = find_lfsr_block(data, seven_start_actual, seven_dsz, 0)
     if custom_dec_off is None:
         print('ERROR: could not locate customDecryptor in sevenStage')
-        return
+        return False
     custom_dec_addr = seven_start_actual + custom_dec_off
     print(f'  customDecryptor at seven+0x{custom_dec_off:X}')
     decrypt_data6(data, custom_dec_addr)
     custom_dec = generate_custom_decryptor(data, custom_dec_addr)
     if custom_dec is None:
-        return
+        return False
 
     # PE32: eighthStageKey — brute-force search (like PE32+ path)
     seven_cs = checksum_with_size_xor(data, seven_stage_cs_addr)
@@ -2460,7 +2490,7 @@ def main():
             pass
     if not eighth_key_success:
         print('ERROR: could not find valid eighthStageKey in sevenStage')
-        return
+        return False
 
     eighth_start = u32(data, eighth_addr)
     print(f'  eighthStageStart = 0x{eighth_start:08X}, dsz = 0x{eighth_dsz:X}')
@@ -2615,7 +2645,7 @@ def main():
                       f'{len(lfsr_candidates)} candidates)')
             else:
                 print('ERROR: could not locate file LFSR in eighthStage')
-                return
+                return False
     else:
         compressed_info_slot = eighth_start + off_compressed_info
         scan_off = off_zero_list + 8
@@ -2632,7 +2662,7 @@ def main():
             scan_off = candidate + 1
         if lfsr_off is None:
             print('ERROR: could not validate file LFSR in native DLL eighthStage')
-            return
+            return False
         print(f'  native DLL fileLFSR selected by decompression validation: '
               f'eighth+0x{lfsr_off:X}')
 
@@ -2641,7 +2671,7 @@ def main():
     decrypt_data6(data, file_dec_addr)
     file_dec = generate_custom_decryptor(data, file_dec_addr)
     if file_dec is None:
-        return
+        return False
 
     # ---- PE32 metadata: EP and data dirs from info[3] ----
     test_val = u32(data, info[3] + 0x10)
@@ -3038,7 +3068,82 @@ def main():
     with open(out_file, 'wb') as f:
         f.write(data)
     print(f'Done! {_elapsed()}')
+    return True
+
+
+def _process_candidate(in_file):
+    try:
+        with open(in_file, 'rb') as source:
+            file_data = bytearray(source.read())
+    except OSError as exc:
+        print(f'[FAILED] Cannot read {in_file}: {exc}')
+        return 'failed'
+
+    state, detail = _inspect_crackproof_pe(file_data)
+    if state == 'plain':
+        print(f'[SKIP] CrackProof protection not detected: {in_file}')
+        return 'plain'
+    if state == 'invalid':
+        print(f'[SKIP] Not a valid PE file: {in_file} ({detail})')
+        return 'invalid'
+
+    global _t0
+    _t0 = _time.perf_counter()
+    try:
+        if _decrypt_file(in_file, file_data):
+            return 'success'
+    except Exception as exc:
+        # A malformed/corrupted candidate must not abort the remaining folder.
+        print(f'[FAILED] {in_file}: {type(exc).__name__}: {exc}')
+    return 'failed'
+
+
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else list(argv)
+    if not args or len(args) > 2:
+        print('Usage: python decrypt.py <input_file_or_folder> [aes_tables_dir]')
+        print('Folder mode scans .exe and .dll files recursively; unpacked files are skipped.')
+        return 2
+
+    input_path = os.path.abspath(args[0])
+    aes_dir = args[1] if len(args) == 2 else None
+
+    # AES tables are standard constants, so generate them once at startup by
+    # default. Passing a directory keeps compatibility with the legacy files.
+    if aes_dir and all(os.path.exists(os.path.join(aes_dir, n)) for n in _AES_TABLE_FILES):
+        print(f'Loading AES tables from {aes_dir}')
+    else:
+        print('Generating AES tables in code (no external table files)')
+    load_aes_tables(aes_dir)
+
+    if os.path.isfile(input_path):
+        if not _has_supported_pe_extension(input_path):
+            print(f'[SKIP] Only .exe and .dll files are supported: {input_path}')
+            return 0
+        result = _process_candidate(input_path)
+        return 1 if result == 'failed' else 0
+
+    if not os.path.isdir(input_path):
+        print(f'ERROR: input path does not exist: {input_path}')
+        return 2
+
+    candidates = _iter_folder_candidates(input_path)
+    print(f'Folder scan complete: {input_path}')
+    print(f'Found {len(candidates)} EXE/DLL file(s), including subfolders')
+    counts = {'success': 0, 'plain': 0, 'invalid': 0, 'failed': 0}
+    for index, candidate in enumerate(candidates, 1):
+        print(f'\n[{index}/{len(candidates)}] {candidate}')
+        print('-' * 72)
+        counts[_process_candidate(candidate)] += 1
+
+    print('\n=== Batch complete ===')
+    print(f'  Successfully unpacked: {counts["success"]}')
+    print(f'  Unpacked files skipped: {counts["plain"]}')
+    print(f'  Invalid PE files skipped: {counts["invalid"]}')
+    print(f'  Failed: {counts["failed"]}')
+    print(f'  Total scanned: {len(candidates)}')
+    return 1 if counts['failed'] else 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
